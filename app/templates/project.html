@@ -1,0 +1,948 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} — CCHQ Pipeline{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('index') }}" class="back">← Projects</a>
+    <h1>{{ project.name }}</h1>
+    <p class="meta">
+      Region: <code>{{ project.region_code }}</code> &nbsp;·&nbsp;
+      {{ project.postcodes | length }} postcode(s) &nbsp;·&nbsp;
+      {% if project.event_date %}Event: {{ project.event_date }} &nbsp;·&nbsp;{% endif %}
+      Created: {{ project.created_at[:10] }}
+    </p>
+  </div>
+  <div style="display:flex;gap:0.5rem;align-items:flex-start">
+    {% set is_running = project.stage1_status == 'running' or project.stage5_status == 'running' or project.stage7_status == 'running' %}
+    {% if is_running %}
+    <form method="POST" action="{{ url_for('pause_job', project_id=project.id) }}">
+      <button type="submit" class="btn btn-secondary">⏸ Pause</button>
+    </form>
+    {% endif %}
+    <form method="POST" action="{{ url_for('delete_project', project_id=project.id) }}"
+          onsubmit="return confirm('Delete project {{ project.name }} and all its files? This cannot be undone.')">
+      <button type="submit" class="btn btn-danger">Delete project</button>
+    </form>
+  </div>
+</div>
+
+{% if not has_api_key %}
+<div class="alert alert-error">
+  <strong>CH_API_KEY not set.</strong> Add it to <code>app/.env</code> before fetching. You can still import an existing master below.
+</div>
+{% endif %}
+
+{% if missing_uids and missing_uids > 0 %}
+<div class="alert" style="background:#fed7aa;color:#9a3412;border:1px solid #fdba74;padding:0.6rem 0.75rem;border-radius:6px;margin-bottom:0.75rem">
+  <strong>{{ missing_uids }} row{{ 's' if missing_uids != 1 }} missing a Unique ID.</strong>
+  This usually means the master was imported with an empty Unique ID column.
+  The final deliverable will have blank ID cells until this is fixed.
+  <form method="POST" action="{{ url_for('repair_unique_ids', project_id=project.id) }}"
+        style="display:inline;margin-left:0.5rem"
+        onsubmit="return confirm('Backfill {{ missing_uids }} missing Unique ID(s) across every master file in this project? If a final XLSX exists it will be regenerated.');">
+    <button type="submit" class="btn btn-primary" style="font-size:0.82rem;padding:0.25rem 0.7rem">
+      Backfill {{ missing_uids }} ID{{ 's' if missing_uids != 1 }}
+    </button>
+  </form>
+</div>
+{% endif %}
+
+<!-- ── Stage 1: Companies House Fetch ─────────────────────────────────────── -->
+<div class="stage-card" id="stage1-card">
+  <div class="stage-header">
+    <h2>Stage 1 — Companies House Fetch</h2>
+    <span class="badge badge-{{ project.stage1_status }}" id="s1-badge">{{ project.stage1_status }}</span>
+  </div>
+
+  <p>
+    Enter one or more search areas — one per line. Each area fetches all active companies
+    registered there and their officers. Use <em>Check counts</em> first to see how many
+    companies each area has and how long the fetch will take.
+  </p>
+
+  {% if project.stage1_status != 'running' %}
+  <div style="margin-bottom:0.75rem">
+    <label style="font-size:0.82rem;font-weight:600;display:block;margin-bottom:0.3rem">Search areas</label>
+    <textarea id="search-areas" rows="4"
+              style="width:100%;max-width:400px;padding:0.45rem 0.65rem;border:1px solid #ccc;border-radius:4px;font-family:monospace;font-size:0.88rem;resize:vertical"
+              placeholder="SW1A&#10;Leicester&#10;LE1">{{ project.postcodes | join('\n') }}</textarea>
+    <small style="display:block;color:#666;margin-top:0.25rem">
+      Postcode districts (e.g. <code>SW1A</code>, <code>LE1</code>) or town names (e.g. <code>Leicester</code>).
+      One per line.
+    </small>
+  </div>
+
+  <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+    <button class="btn btn-secondary" id="count-btn" onclick="checkCounts()"
+            {% if not has_api_key %}disabled{% endif %}>
+      Check counts
+    </button>
+    <button class="btn btn-primary" id="fetch-btn" onclick="startFetch()"
+            {% if not has_api_key %}disabled title="CH_API_KEY not set in .env"{% endif %}>
+      {% if project.stage1_status == 'paused' %}Resume fetch
+      {% elif project.stage1_status == 'complete' %}Re-run fetch
+      {% else %}Start fetch{% endif %}
+    </button>
+  </div>
+  <div id="count-results" style="margin-top:0.75rem"></div>
+  {% else %}
+    <button class="btn btn-primary" disabled>Running… <span id="s1-progress-text"></span></button>
+  {% endif %}
+
+  <!-- Per-area results (shown once areas have been searched) -->
+  {% if project.postcodes %}
+  <table class="table pc-table" id="pc-table" style="margin-top:1rem">
+    <thead>
+      <tr><th>Area</th><th>Status</th><th>Rows</th><th>Last message</th><th>Download</th></tr>
+    </thead>
+    <tbody id="pc-tbody">
+      {% for area in project.postcodes %}
+      {% set done = existing_csvs.get(area, False) %}
+      <tr id="pc-row-{{ area | replace(' ', '') }}">
+        <td><code>{{ area }}</code></td>
+        <td><span class="badge {% if done %}badge-complete{% else %}badge-pending{% endif %}"
+                  id="pc-status-{{ area | replace(' ', '') }}">{% if done %}done{% else %}pending{% endif %}</span></td>
+        <td id="pc-rows-{{ area | replace(' ', '') }}">—</td>
+        <td class="log-msg" id="pc-log-{{ area | replace(' ', '') }}">—</td>
+        <td>{% if done %}
+          <a href="{{ url_for('download_file', project_id=project.id,
+                     filename='postcodes/results_' + area.replace(' ', '') + '.csv') }}"
+             class="dl-link">CSV</a>
+        {% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if project.stage1_status == 'complete' %}
+  <div style="margin-top:0.75rem">
+    <button class="btn btn-secondary" style="font-size:0.82rem" onclick="loadStage1Preview(this)">
+      Preview results
+    </button>
+    <div id="s1-preview" style="margin-top:0.75rem;overflow-x:auto"></div>
+  </div>
+  {% endif %}
+
+  {% if logs1 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs1 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs1 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+<!-- ── Stage 2: Regional Merge ────────────────────────────────────────────── -->
+<div class="stage-card" id="stage2-card">
+  <div class="stage-header">
+    <h2>Stage 2 — Regional Merge + Unique IDs</h2>
+    <span class="badge badge-{{ project.stage2_status }}" id="s2-badge">{{ project.stage2_status }}</span>
+  </div>
+
+  <p>
+    Concatenates all postcode CSVs, flags duplicate persons (same name + DOB),
+    assigns <code>#{{ project.region_code }}-0001</code> style Unique IDs,
+    and maps SIC codes to industry labels.
+  </p>
+
+  {% if project.stage1_status == 'complete' %}
+    {% if project.stage2_status in ('pending', 'error') %}
+      <button class="btn btn-primary" onclick="runMerge()">Run merge</button>
+    {% elif project.stage2_status == 'running' %}
+      <button class="btn btn-primary" disabled>Running…</button>
+    {% elif project.stage2_status == 'complete' %}
+      <button class="btn btn-secondary" onclick="runMerge()">Re-run merge</button>
+    {% endif %}
+  {% else %}
+    <button class="btn btn-primary" disabled title="Complete Stage 1 first">Run merge</button>
+  {% endif %}
+
+  {% if files.master_raw %}
+  <p style="margin-top:0.75rem">
+    Master CSV ready:
+    <a href="{{ url_for('download_file', project_id=project.id,
+               filename='master_' + project.region_code + '_raw.csv') }}" class="dl-link">
+      master_{{ project.region_code }}_raw.csv
+    </a>
+  </p>
+  {% endif %}
+
+  <div id="merge-status" style="margin-top:0.5rem"></div>
+
+  <!-- Import existing master shortcut -->
+  <details class="log-details" style="margin-top:1rem">
+    <summary style="color:#555;font-size:0.82rem;cursor:pointer">Or import an existing master CSV/XLSX (skips Stages 1–2)</summary>
+    <form method="POST" action="{{ url_for('import_master', project_id=project.id) }}"
+          enctype="multipart/form-data" style="margin-top:0.75rem">
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <input type="file" name="file" accept=".csv,.xlsx" required
+               style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
+        <button type="submit" class="btn btn-secondary">Import master</button>
+      </div>
+      <small style="color:#666;display:block;margin-top:0.3rem">
+        Must contain a <code>Unique ID</code> column. Sets Stages 1 &amp; 2 to complete.
+      </small>
+    </form>
+  </details>
+
+  {% if logs2 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs2 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs2 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+<!-- ── Stage 3: Apollo Batch Magazine ─────────────────────────────────────── -->
+<div class="stage-card" id="stage3-card">
+  <div class="stage-header">
+    <h2>Stage 3 — Apollo Batch Magazine</h2>
+    <span class="badge badge-{{ project.stage3_status }}" id="s3-badge">{{ project.stage3_status }}</span>
+  </div>
+
+  <p>
+    Filters out duplicates and builds ≤10,000-row upload CSVs for Apollo.io enrichment.
+    Download each batch, upload to Apollo, then come back for Stage 4. If you set a
+    credit budget below, rows beyond the budget get deferred to
+    <code>apollo_deferred_&lt;region&gt;.csv</code> for the next run.
+  </p>
+
+  {% if project.stage2_status == 'complete' %}
+    <form method="POST" action="{{ url_for('stage3_build', project_id=project.id) }}" style="display:inline">
+      <label style="font-size:0.82rem;margin-right:0.5rem">
+        <input type="checkbox" name="exclude_dissolved" value="1" checked> Exclude dissolved companies
+      </label>
+      <label style="font-size:0.82rem;margin-right:0.75rem">
+        <input type="checkbox" name="exclude_non_uk" value="1" checked> Exclude non-UK officer addresses
+      </label>
+      <label style="font-size:0.82rem;margin-right:0.5rem">
+        Credit budget:
+        <input type="number" name="credit_budget" id="credit-budget-input"
+               min="0" step="1000" placeholder="optional"
+               style="width:7rem;font-size:0.82rem;padding:0.15rem 0.3rem">
+      </label>
+      <label style="font-size:0.82rem;margin-right:0.5rem" title="Rows per batch file. Apollo caps at 10,000 — pick lower for parallel uploads.">
+        Batch size:
+        <input type="number" name="batch_size"
+               min="1" max="10000" step="500" placeholder="10000"
+               style="width:6rem;font-size:0.82rem;padding:0.15rem 0.3rem">
+      </label>
+      <button type="button" class="btn btn-secondary" id="fetch-credits-btn"
+              style="font-size:0.78rem;padding:0.25rem 0.5rem;margin-right:0.5rem"
+              onclick="fetchApolloCredits()">Fetch from Apollo</button>
+      <span id="fetch-credits-status" style="font-size:0.78rem;color:#666"></span>
+      <button type="submit" class="btn btn-primary">Build batches</button>
+    </form>
+    <script>
+      function fetchApolloCredits() {
+        const status = document.getElementById('fetch-credits-status');
+        status.textContent = 'fetching…';
+        fetch('{{ url_for("apollo_credits_route") }}')
+          .then(r => r.json())
+          .then(data => {
+            if (data.credits_remaining !== null && data.credits_remaining !== undefined) {
+              document.getElementById('credit-budget-input').value = data.credits_remaining;
+              status.textContent = 'fetched: ' + data.credits_remaining.toLocaleString();
+            } else {
+              status.textContent = data.reason || 'unavailable — enter manually';
+            }
+          })
+          .catch(() => { status.textContent = 'network error — enter manually'; });
+      }
+    </script>
+  {% else %}
+    <button class="btn btn-primary" disabled title="Complete Stage 2 first">Build batches</button>
+  {% endif %}
+
+  {% if batches %}
+  <table class="table" style="margin-top:1rem">
+    <thead>
+      <tr><th>Batch</th><th>Rows</th><th>Status</th><th>Download</th><th>Mark sent</th></tr>
+    </thead>
+    <tbody>
+      {% for b in batches %}
+      <tr>
+        <td>#{{ b.batch_num }}</td>
+        <td>{{ "{:,}".format(b.row_count | default(0) | int) }}</td>
+        <td><span class="badge badge-{{ b.status }}">{{ b.status }}</span></td>
+        <td>
+          <a href="{{ url_for('download_file', project_id=project.id, filename=b.filename) }}"
+             class="dl-link">Download</a>
+        </td>
+        <td>
+          {% if b.status == 'pending' %}
+          <form method="POST" action="{{ url_for('stage3_mark_sent', project_id=project.id) }}"
+                style="display:inline">
+            <input type="hidden" name="batch_id" value="{{ b.id }}">
+            <button type="submit" class="btn btn-secondary" style="font-size:0.78rem;padding:0.25rem 0.6rem">
+              Mark sent
+            </button>
+          </form>
+          {% else %}
+          <span style="color:#888;font-size:0.82rem">{{ b.status }}</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if logs3 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs3 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs3 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+<!-- ── Stage 4: Apollo Result Ingest ──────────────────────────────────────── -->
+<div class="stage-card" id="stage4-card">
+  <div class="stage-header">
+    <h2>Stage 4 — Apollo Result Ingest</h2>
+    <span class="badge badge-{{ project.stage4_status }}" id="s4-badge">{{ project.stage4_status }}</span>
+  </div>
+
+  <p>
+    Upload the Apollo-enriched CSV for each batch. The enrichment columns are joined
+    back to the master by Unique ID.
+    {% if batches %}
+    <strong>{{ batches_ingested }}/{{ batches | length }} batches ingested.</strong>
+    {% endif %}
+  </p>
+
+  {% if project.stage3_status == 'complete' %}
+    {% if batches_ingested == batches | length and batches | length > 0 %}
+      <p style="color:#065f46;font-weight:600">All batches ingested.</p>
+    {% else %}
+    <!-- ── Drop zone (primary upload path) ──────────────────────────────── -->
+    <div id="s4-drop-zone"
+         style="border:2px dashed #ccc;border-radius:8px;padding:1.75rem 1.5rem;text-align:center;
+                background:#fafafa;cursor:pointer;transition:border-color 0.2s;max-width:540px"
+         ondragover="event.preventDefault();this.style.borderColor='#2563eb'"
+         ondragleave="this.style.borderColor='#ccc'"
+         ondrop="s4HandleDrop(event)">
+      <p style="margin:0;color:#444;font-size:0.9rem">
+        Drag Apollo result CSV(s) here, or
+        <label style="color:#2563eb;cursor:pointer;text-decoration:underline">
+          click to browse
+          <input type="file" id="s4-files" accept=".csv" multiple
+                 style="display:none" onchange="s4UploadFiles(this.files)">
+        </label>
+      </p>
+      <p style="margin:0.35rem 0 0;color:#888;font-size:0.78rem">
+        Drop one or more files — matched to the master by Unique ID. Batch order doesn't matter.
+      </p>
+    </div>
+    <div id="s4-upload-progress" style="margin-top:0.75rem"></div>
+
+    <!-- ── Per-batch fallback (one at a time) ──────────────────────────── -->
+    {% set pending_batches = batches | selectattr("status", "ne", "ingested") | selectattr("status", "ne", "pending") | list %}
+    {% if pending_batches %}
+    <details style="margin-top:1rem">
+      <summary style="font-size:0.82rem;color:#555;cursor:pointer">Upload one batch at a time</summary>
+      <div style="margin-top:0.75rem">
+        {% for b in pending_batches %}
+        <div style="margin-bottom:0.75rem;padding:0.75rem;background:#f9f9f9;border-radius:6px;border:1px solid #eee">
+          <strong style="font-size:0.85rem">Batch #{{ b.batch_num }}</strong>
+          <span class="badge badge-{{ b.status }}" style="margin-left:0.4rem">{{ b.status }}</span>
+          <form method="POST" action="{{ url_for('stage4_upload', project_id=project.id) }}"
+                enctype="multipart/form-data" style="margin-top:0.5rem;display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+            <input type="hidden" name="batch_id" value="{{ b.id }}">
+            <input type="file" name="file" accept=".csv" required
+                   style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
+            <button type="submit" class="btn btn-primary" style="font-size:0.82rem">Upload result</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+    </details>
+    {% endif %}
+    {% endif %}
+
+    {% if files.master_enriched %}
+    <p style="margin-top:0.75rem">
+      <a href="{{ url_for('download_file', project_id=project.id,
+                 filename='master_' + project.region_code + '_enriched.csv') }}" class="dl-link">
+        Download enriched master
+      </a>
+    </p>
+    {% endif %}
+
+    <!-- ── Prefill from previous export ───────────────────────────────── -->
+    <details style="margin-top:1rem">
+      <summary style="font-size:0.82rem;color:#555;cursor:pointer">
+        Prefill from a previous export (skip Apollo for known contacts)
+      </summary>
+      <form method="POST" action="{{ url_for('stage4_prefill', project_id=project.id) }}"
+            enctype="multipart/form-data"
+            style="margin-top:0.75rem;display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <input type="file" name="file" accept=".csv" required style="font-size:0.82rem">
+        <button type="submit" class="btn btn-secondary">Prefill</button>
+      </form>
+      <small style="color:#666;margin-top:0.3rem;display:block">
+        Upload a previous <code>master_*_enriched.csv</code>. Matches by name + DOB and copies
+        Apollo enrichment columns for any found contacts.
+      </small>
+    </details>
+
+  {% else %}
+    <p style="color:#888">Complete Stage 3 first.</p>
+  {% endif %}
+
+  {% if logs4 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs4 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs4 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+<!-- ── Stage 5: Y/T/N Classifier ──────────────────────────────────────────── -->
+<div class="stage-card" id="stage5-card">
+  <div class="stage-header">
+    <h2>Stage 5 — Y/T/N Auto-Classifier</h2>
+    <span class="badge badge-{{ project.stage5_status }}" id="s5-badge">{{ project.stage5_status }}</span>
+  </div>
+
+  <p>
+    Three-pass cascade: deterministic name similarity → Gemini Flash disambiguation → human review.
+    Adds a <code>Result</code> column (Y/T/N) to the master.
+    {% if not has_gemini %}
+    <span style="color:#92400e">⚠ GEMINI_API_KEY not set — Tentative rows will go straight to human review.</span>
+    {% endif %}
+  </p>
+
+  {% if project.stage4_status == 'complete' %}
+    {% if project.stage5_status in ('pending', 'error') %}
+      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}"
+            style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">
+        <button type="submit" class="btn btn-primary">Run classifier</button>
+        <label class="inline-check" title="Untick if you know Gemini is out of credits or unavailable">
+          <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
+          Use Gemini for Pass 2
+        </label>
+      </form>
+    {% elif project.stage5_status == 'running' %}
+      <button class="btn btn-primary" disabled>Running… <span id="s5-progress"></span></button>
+    {% elif project.stage5_status == 'gemini_unavailable' %}
+      <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;margin-bottom:0.75rem">
+        <strong>Gemini unavailable.</strong>
+        {% if job and job.stage == 5 and job.detail %}
+        {{ job.progress }} — <code style="font-size:0.78rem">{{ job.detail }}</code>
+        {% else %}
+        Pass 2 was aborted because Gemini failed repeatedly. Retry once credits return, or continue manually (every Tentative row goes to human review).
+        {% endif %}
+      </div>
+      <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
+        <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}" style="display:inline">
+          <input type="hidden" name="use_gemini" value="1">
+          <button type="submit" class="btn btn-primary">Retry with Gemini</button>
+        </form>
+        <form method="POST" action="{{ url_for('stage5_continue_manually', project_id=project.id) }}" style="display:inline">
+          <button type="submit" class="btn btn-secondary">Continue without Gemini</button>
+        </form>
+      </div>
+    {% elif project.stage5_status == 'review_needed' %}
+      <a href="{{ url_for('stage5_review', project_id=project.id) }}" class="btn btn-primary">
+        Review {{ s5_review_count }} row{{ 's' if s5_review_count != 1 }}
+      </a>
+    {% elif project.stage5_status == 'complete' %}
+      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}"
+            style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">
+        <button type="submit" class="btn btn-secondary">Re-run classifier</button>
+        <label class="inline-check">
+          <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
+          Use Gemini for Pass 2
+        </label>
+      </form>
+    {% endif %}
+  {% else %}
+    <button class="btn btn-primary" disabled title="Complete Stage 4 first">Run classifier</button>
+  {% endif %}
+
+  {% if files.master_classified %}
+  <p style="margin-top:0.75rem">
+    <a href="{{ url_for('download_file', project_id=project.id,
+               filename='master_' + project.region_code + '_classified.csv') }}" class="dl-link">
+      Download classified master
+    </a>
+    {% if files.class_log %}
+    &nbsp;·&nbsp;
+    <a href="{{ url_for('download_file', project_id=project.id, filename='classifications_log.csv') }}"
+       class="dl-link">Audit log</a>
+    {% endif %}
+  </p>
+  {% endif %}
+
+  {% if logs5 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs5 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs5 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+<!-- ── Stage 6: VoteSource Pause/Resume ───────────────────────────────────── -->
+<div class="stage-card" id="stage6-card">
+  <div class="stage-header">
+    <h2>Stage 6 — VoteSource (Optional)</h2>
+    <span class="badge badge-{{ project.stage6_status }}" id="s6-badge">{{ project.stage6_status }}</span>
+  </div>
+
+  <p>
+    Export a VS upload file, send to the VoteSource team, then upload the return
+    when it arrives. Skip if no VoteSource overlay is needed for this event.
+  </p>
+
+  {% if project.stage5_status == 'complete' %}
+    {% if project.stage6_status == 'pending' %}
+      <div class="actions">
+        <form method="POST" action="{{ url_for('stage6_export_vs', project_id=project.id) }}" style="display:inline">
+          <button type="submit" class="btn btn-primary">Export VS file</button>
+        </form>
+        <form method="POST" action="{{ url_for('stage6_skip', project_id=project.id) }}" style="display:inline">
+          <button type="submit" class="btn btn-secondary">Skip VoteSource</button>
+        </form>
+      </div>
+    {% elif project.stage6_status == 'awaiting' %}
+      <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;margin-bottom:0.75rem">
+        <strong>Waiting for VoteSource return.</strong>
+        {% if project.vs_sent_at %}
+        Sent at {{ project.vs_sent_at[:16] | replace('T', ' ') }}.
+        {% endif %}
+        <a href="{{ url_for('download_file', project_id=project.id,
+                   filename='vs_export_' + project.region_code + '.csv') }}"
+           class="dl-link" style="margin-left:0.5rem">Download VS export</a>
+      </div>
+      <form method="POST" action="{{ url_for('stage6_upload_return', project_id=project.id) }}"
+            enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <input type="file" name="file" accept=".csv" required
+               style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
+        <button type="submit" class="btn btn-primary">Upload VS return</button>
+      </form>
+      <form method="POST" action="{{ url_for('stage6_skip', project_id=project.id) }}"
+            style="display:inline;margin-top:0.5rem">
+        <button type="submit" class="btn btn-secondary">Skip (proceed without VS)</button>
+      </form>
+    {% elif project.stage6_status == 'complete' %}
+      <p style="color:#065f46;font-weight:600">VS return ingested.</p>
+      {% if files.master_vs %}
+      <a href="{{ url_for('download_file', project_id=project.id,
+                 filename='master_' + project.region_code + '_vs.csv') }}" class="dl-link">
+        Download VS master
+      </a>
+      {% endif %}
+    {% elif project.stage6_status == 'skipped' %}
+      <p style="color:#3730a3">Stage skipped — proceeding without VoteSource overlay.</p>
+    {% endif %}
+  {% else %}
+    <button class="btn btn-primary" disabled title="Complete Stage 5 first">Export VS file</button>
+    <button class="btn btn-secondary" disabled>Skip VoteSource</button>
+  {% endif %}
+
+  {% if logs6 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs6 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs6 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+<!-- ── Stage 7: Raiser's Edge Flagger ─────────────────────────────────────── -->
+<div class="stage-card" id="stage7-card">
+  <div class="stage-header">
+    <h2>Stage 7 — Raiser's Edge Cross-Reference</h2>
+    <span class="badge badge-{{ project.stage7_status }}" id="s7-badge">{{ project.stage7_status }}</span>
+  </div>
+
+  <p>
+    Upload the RE export (XLSX or ODS) to fuzzy-match constituent names against the master.
+    Adds <code>RE Match?</code>, <code>Potential</code>, and <code>Match?</code> columns.
+    Skip if no RE cross-reference is needed.
+    {% if not has_gemini %}
+    <span style="color:#92400e">⚠ GEMINI_API_KEY not set — medium-confidence matches go straight to human review.</span>
+    {% endif %}
+  </p>
+
+  {% set s6_done = project.stage6_status in ('complete', 'skipped') %}
+  {% if project.stage5_status == 'complete' and s6_done %}
+    {% if project.stage7_status in ('pending', 'error') %}
+      <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
+        <form method="POST" action="{{ url_for('stage7_upload_re', project_id=project.id) }}"
+              enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+          <input type="file" name="file" accept=".xlsx,.ods" required
+                 style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
+          <button type="submit" class="btn btn-primary">Upload RE export &amp; run</button>
+          <label class="inline-check" title="Untick if you know Gemini is out of credits or unavailable">
+            <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
+            Use Gemini for Pass 2
+          </label>
+        </form>
+        <form method="POST" action="{{ url_for('stage7_skip', project_id=project.id) }}" style="display:inline">
+          <button type="submit" class="btn btn-secondary">Skip RE cross-reference</button>
+        </form>
+      </div>
+    {% elif project.stage7_status == 'running' %}
+      <button class="btn btn-primary" disabled>Running… <span id="s7-progress"></span></button>
+    {% elif project.stage7_status == 'gemini_unavailable' %}
+      <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;margin-bottom:0.75rem">
+        <strong>Gemini unavailable.</strong>
+        {% if job and job.stage == 7 and job.detail %}
+        {{ job.progress }} — <code style="font-size:0.78rem">{{ job.detail }}</code>
+        {% else %}
+        Pass 2 was aborted because Gemini failed repeatedly. Retry once credits return, or continue manually (every medium-confidence match goes to human review).
+        {% endif %}
+      </div>
+      <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
+        <form method="POST" action="{{ url_for('stage7_continue_manually', project_id=project.id) }}" style="display:inline">
+          <button type="submit" class="btn btn-secondary">Continue without Gemini</button>
+        </form>
+        <form method="POST" action="{{ url_for('stage7_upload_re', project_id=project.id) }}"
+              enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+          <input type="file" name="file" accept=".xlsx,.ods" required
+                 style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
+          <input type="hidden" name="use_gemini" value="1">
+          <button type="submit" class="btn btn-primary">Retry with Gemini (re-upload RE)</button>
+        </form>
+      </div>
+    {% elif project.stage7_status == 'review_needed' %}
+      <a href="{{ url_for('stage7_review', project_id=project.id) }}" class="btn btn-primary">
+        Review {{ s7_review_count }} match{{ 'es' if s7_review_count != 1 }}
+      </a>
+    {% elif project.stage7_status in ('complete', 'skipped') %}
+      {% if project.stage7_status == 'complete' %}
+        <p style="color:#065f46;font-weight:600">RE flagging complete.</p>
+        {% if files.master_re %}
+        <a href="{{ url_for('download_file', project_id=project.id,
+                   filename='master_' + project.region_code + '_re_flagged.csv') }}" class="dl-link">
+          Download RE-flagged master
+        </a>
+        {% endif %}
+      {% else %}
+        <p style="color:#3730a3">Stage skipped — no RE cross-reference.</p>
+      {% endif %}
+      <!-- Allow re-upload -->
+      <form method="POST" action="{{ url_for('stage7_upload_re', project_id=project.id) }}"
+            enctype="multipart/form-data" style="margin-top:0.75rem;display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <input type="file" name="file" accept=".xlsx,.ods"
+               style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
+        <button type="submit" class="btn btn-secondary" style="font-size:0.82rem">Re-upload RE export</button>
+      </form>
+    {% endif %}
+  {% else %}
+    <button class="btn btn-primary" disabled title="Complete Stages 5 and 6 first">Upload RE export</button>
+    <button class="btn btn-secondary" disabled>Skip RE cross-reference</button>
+  {% endif %}
+
+  {% if logs7 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs7 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs7 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+<!-- ── Stage 8: Final Export ──────────────────────────────────────────────── -->
+<div class="stage-card" id="stage8-card">
+  <div class="stage-header">
+    <h2>Stage 8 — Final Deliverable Export</h2>
+    <span class="badge badge-{{ project.stage8_status }}" id="s8-badge">{{ project.stage8_status }}</span>
+  </div>
+
+  <p>
+    Builds the final multi-tab XLSX (ALL, Y&amp;T, Potential RE Match) ready to hand off
+    to the Treasurers.
+  </p>
+
+  {% set s7_done = project.stage7_status in ('complete', 'skipped') %}
+  {% if project.stage5_status == 'complete' %}
+    <form method="POST" action="{{ url_for('stage8_export', project_id=project.id) }}" style="display:inline">
+      <button type="submit" class="btn btn-primary">Generate final deliverable</button>
+    </form>
+  {% else %}
+    <button class="btn btn-primary" disabled title="Complete Stage 5 first">Generate final deliverable</button>
+  {% endif %}
+
+  {% if files.final %}
+  <p style="margin-top:0.75rem">
+    <a href="{{ url_for('download_file', project_id=project.id,
+               filename=project.region_code + '_final_deliverable.xlsx') }}" class="dl-link">
+      Download {{ project.region_code }}_final_deliverable.xlsx
+    </a>
+  </p>
+  {% endif %}
+
+  {% if logs8 %}
+  <details class="log-details">
+    <summary>Full log ({{ logs8 | length }} lines)</summary>
+    <div class="log-box">
+      {% for line in logs8 %}
+      <div><span class="ts">{{ line.ts }}</span> {{ line.message }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+
+<script>
+const projectId = {{ project.id }};
+let polling = null;
+
+function checkCounts() {
+  const btn = document.getElementById('count-btn');
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  const areas = document.getElementById('search-areas')?.value || '';
+  const body = new URLSearchParams({ search_areas: areas });
+
+  fetch(`/project/${projectId}/fetch/count`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  })
+    .then(r => r.json())
+    .then(data => {
+      btn.disabled = false;
+      btn.textContent = 'Check counts';
+      const el = document.getElementById('count-results');
+      if (data.error) { el.innerHTML = `<p style="color:#991b1b">${data.error}</p>`; return; }
+
+      let html = '<table class="table" style="margin-top:0;max-width:640px"><thead><tr><th>Area</th><th>Companies</th><th>Est. time</th><th></th></tr></thead><tbody>';
+      for (const r of data.counts) {
+        const mins = Math.round(r.total * 0.17 / 60);
+        const timeStr = mins < 1 ? '<1 min' : `~${mins} min`;
+        const warn = r.error
+          ? `<span style="color:#991b1b">⚠ ${r.error}</span>`
+          : r.capped
+          ? `<span style="color:#991b1b">⚠ Over 10,000 — CH API will cap results. Try a smaller district (e.g. <code>SW1A</code> instead of <code>SW1</code>).</span>`
+          : r.total > 2000
+          ? `<span style="color:#92400e">⚠ Large — fetch will take ~${timeStr}</span>`
+          : '<span style="color:#065f46">✓ Looks good</span>';
+        html += `<tr>
+          <td><code>${r.area}</code></td>
+          <td>${r.error ? '—' : r.total.toLocaleString()}</td>
+          <td>${r.error ? '—' : timeStr}</td>
+          <td style="font-size:0.8rem">${warn}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    });
+}
+
+function startFetch() {
+  const btn = document.getElementById('fetch-btn');
+  btn.disabled = true;
+  const areas = document.getElementById('search-areas')?.value || '';
+  const body = new URLSearchParams({ search_areas: areas });
+  fetch(`/project/${projectId}/fetch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { alert(d.error); btn.disabled = false; return; }
+      startPolling();
+    });
+}
+
+function runMerge() {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  document.getElementById('merge-status').textContent = '';
+
+  fetch(`/project/${projectId}/merge`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) {
+        document.getElementById('merge-status').textContent = 'Error: ' + d.error;
+        btn.disabled = false;
+        btn.textContent = 'Re-run merge';
+        return;
+      }
+      document.getElementById('merge-status').textContent =
+        `Done — ${d.rows.toLocaleString()} rows. Refreshing…`;
+      // Reload so the new download link / Stage 3 form actions appear without
+      // the user having to do it manually.
+      setTimeout(() => location.reload(), 400);
+    });
+}
+
+function startPolling() {
+  if (polling) return;
+  polling = setInterval(pollStatus, 2000);
+  pollStatus();
+}
+
+// Snapshot the stage statuses as the page rendered. We reload on any
+// transition away from this snapshot, so the user never has to refresh
+// manually to see new buttons / download links / review queues appear.
+const STAGE_SNAPSHOT = {
+  stage1_status: {{ project.stage1_status | tojson }},
+  stage2_status: {{ project.stage2_status | tojson }},
+  stage3_status: {{ project.stage3_status | tojson }},
+  stage4_status: {{ project.stage4_status | tojson }},
+  stage5_status: {{ project.stage5_status | tojson }},
+  stage6_status: {{ project.stage6_status | tojson }},
+  stage7_status: {{ project.stage7_status | tojson }},
+  stage8_status: {{ project.stage8_status | tojson }},
+};
+
+function pollStatus() {
+  fetch(`/project/${projectId}/status.json`)
+    .then(r => r.json())
+    .then(data => {
+      // Update all stage badges in place (cheap, no flash)
+      ['1','2','3','4','5','6','7','8'].forEach(n => {
+        const key = `stage${n}_status`;
+        const el = document.getElementById(`s${n}-badge`);
+        if (el && data[key]) {
+          el.textContent = data[key];
+          el.className = `badge badge-${data[key]}`;
+        }
+      });
+
+      // Update per-postcode rows from job state (Stage 1)
+      const job = data.job;
+      if (job && job.postcodes) {
+        for (const [pc, info] of Object.entries(job.postcodes)) {
+          const key = pc.replace(' ', '');
+          const statusEl = document.getElementById(`pc-status-${key}`);
+          const rowsEl   = document.getElementById(`pc-rows-${key}`);
+          const logEl    = document.getElementById(`pc-log-${key}`);
+          if (statusEl) {
+            statusEl.textContent = info.status;
+            statusEl.className = `badge badge-${info.status === 'done' ? 'complete' : info.status}`;
+          }
+          if (rowsEl) rowsEl.textContent = info.rows > 0 ? info.rows.toLocaleString() : '—';
+          if (logEl && info.log && info.log.length > 0) {
+            logEl.textContent = info.log[info.log.length - 1];
+          }
+        }
+      }
+
+      // Update in-progress stage text
+      if (job && job.progress) {
+        if (data.stage5_status === 'running') {
+          const el = document.getElementById('s5-progress');
+          if (el) el.textContent = '— ' + job.progress;
+        }
+        if (data.stage7_status === 'running') {
+          const el = document.getElementById('s7-progress');
+          if (el) el.textContent = '— ' + job.progress;
+        }
+      }
+
+      // ── Auto-reload on any stage transition vs. the page-render snapshot ──
+      // Catches running→complete, pending→running, error→pending, etc.
+      // The badge in-place update above gives instant visual feedback;
+      // the reload then brings in any new forms / download links / sections.
+      for (const key of Object.keys(STAGE_SNAPSHOT)) {
+        if (data[key] !== STAGE_SNAPSHOT[key]) {
+          clearInterval(polling);
+          polling = null;
+          setTimeout(() => location.reload(), 400);
+          return;
+        }
+      }
+    });
+}
+
+// Always start polling on page load. Lightweight (one GET every 3s) and
+// stops via location.reload() on the first status change, so this isn't
+// continuous traffic — it's "watch until something changes, then refresh".
+if (!polling) {
+  polling = setInterval(pollStatus, 3000);
+  pollStatus();
+}
+
+// ── Stage 1 preview ────────────────────────────────────────────────────────
+function loadStage1Preview(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  fetch(`/project/${projectId}/stage1/preview`)
+    .then(r => r.json())
+    .then(data => {
+      btn.disabled = false;
+      btn.textContent = 'Preview results';
+      const container = document.getElementById('s1-preview');
+      if (!data.rows || !data.rows.length) {
+        container.innerHTML = '<p style="color:#888;font-size:0.82rem">No rows found.</p>';
+        return;
+      }
+      const cols = Object.keys(data.rows[0]);
+      let html = '<p style="font-size:0.78rem;color:#666;margin-bottom:0.4rem">First 20 rows across all fetched areas</p>';
+      html += '<table class="table" style="font-size:0.78rem;margin-top:0"><thead><tr>'
+        + cols.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
+      for (const row of data.rows) {
+        html += '<tr>' + cols.map(c => `<td>${row[c] || '—'}</td>`).join('') + '</tr>';
+      }
+      html += '</tbody></table>';
+      container.style.display = 'block';
+      container.innerHTML = html;
+    })
+    .catch(() => {
+      btn.disabled = false;
+      btn.textContent = 'Preview results';
+    });
+}
+
+// ── Stage 4 multi-file dropzone ────────────────────────────────────────────
+function s4HandleDrop(e) {
+  e.preventDefault();
+  document.getElementById('s4-drop-zone').style.borderColor = '#ccc';
+  s4UploadFiles(e.dataTransfer.files);
+}
+
+function s4UploadFiles(files) {
+  if (!files || !files.length) return;
+  const progress = document.getElementById('s4-upload-progress');
+  progress.innerHTML = '<p style="color:#555;font-size:0.85rem">Uploading and matching…</p>';
+  const form = new FormData();
+  for (const f of files) form.append('files', f);
+  fetch(`/project/${projectId}/stage4/upload-multiple`, { method: 'POST', body: form })
+    .then(r => { if (r.redirected) { window.location = r.url; } else return r.json(); })
+    .then(data => {
+      if (data && data.error) {
+        progress.innerHTML = `<p style="color:#991b1b;font-size:0.85rem">Error: ${data.error}</p>`;
+      }
+    })
+    .catch(() => {
+      progress.innerHTML = '<p style="color:#991b1b;font-size:0.85rem">Upload failed — try again.</p>';
+    });
+}
+</script>
+{% endblock %}

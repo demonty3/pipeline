@@ -1,0 +1,24 @@
+# Claude Code harness state (plans, memory, settings)
+.claude/
+
+# macOS
+.DS_Store
+
+# Original handover data files (not for source control)
+*.docx
+*.xlsx
+*.xls
+*.ods
+*.csv
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editors / IDEs
+.vscode/
+.idea/

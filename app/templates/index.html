@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Projects — CCHQ Pipeline{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Projects</h1>
+  <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New project</a>
+</div>
+
+{% if projects %}
+<table class="table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Region</th>
+      <th>Search areas</th>
+      <th>Event date</th>
+      <th>Stage 1</th>
+      <th>Stage 2</th>
+      <th>Created</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in projects %}
+    <tr>
+      <td><a href="{{ url_for('project_detail', project_id=p.id) }}">{{ p.name }}</a></td>
+      <td><code>{{ p.region_code }}</code></td>
+      <td>{{ p.postcodes | join(', ') or '—' }}</td>
+      <td>{{ p.event_date or '—' }}</td>
+      <td><span class="badge badge-{{ p.stage1_status }}">{{ p.stage1_status }}</span></td>
+      <td><span class="badge badge-{{ p.stage2_status }}">{{ p.stage2_status }}</span></td>
+      <td>{{ p.created_at[:10] }}</td>
+      <td>
+        <form method="POST" action="{{ url_for('delete_project', project_id=p.id) }}"
+              onsubmit="return confirm('Delete {{ p.name }}? This cannot be undone.')">
+          <button type="submit" class="btn-danger-sm">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No projects yet. <a href="{{ url_for('new_project') }}">Create one.</a></p>
+{% endif %}
+{% endblock %}

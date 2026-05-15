@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}New Project — CCHQ Pipeline{% endblock %}
+
+{% block content %}
+<h1>New Project</h1>
+
+{% if errors %}
+<div class="alert alert-error">
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<form method="POST" class="form">
+  <div class="field">
+    <label for="name">Project name</label>
+    <input type="text" id="name" name="name" value="{{ name }}"
+           placeholder="e.g. Leicester June 2026" required>
+  </div>
+
+  <div class="field">
+    <label for="region_code">Region / ID prefix</label>
+    <input type="text" id="region_code" name="region_code" value="{{ region_code }}"
+           placeholder="e.g. LE1" maxlength="10" required>
+    <small>Used as the Unique ID prefix: <code>#LE1-0001</code></small>
+  </div>
+
+  <div class="field">
+    <label for="event_date">Event date <span class="optional">(optional)</span></label>
+    <input type="date" id="event_date" name="event_date" value="{{ event_date }}">
+    <small>Label only — doesn't affect data processing.</small>
+  </div>
+
+  <div class="field actions">
+    <button type="submit" class="btn btn-primary">Create project</button>
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">Cancel</a>
+  </div>
+</form>
+
+<p style="margin-top:1.5rem;color:#666;font-size:0.82rem">
+  You'll enter the search area (postcode district or town) in Stage 1 after creating the project.
+</p>
+{% endblock %}

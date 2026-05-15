@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{% block title %}Stage 5 Review — {{ project.name }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('project_detail', project_id=project.id) }}" class="back">
+      ← {{ project.name }}
+    </a>
+    <h1>Stage 5 — Human Review</h1>
+    <p class="meta">
+      {{ queue | length }} row{{ 's' if queue | length != 1 }} need a decision.
+      Sorted by fuzzy similarity (highest first).
+      {% if failed_count %}
+      <strong>{{ failed_count }} of these</strong> never got a Gemini answer (errored or no key).
+      {% endif %}
+    </p>
+  </div>
+</div>
+
+{% if placeholder_count > 0 %}
+<div class="alert" style="background:#dbeafe;color:#1e40af;border:1px solid #93c5fd;margin-bottom:0.75rem;padding:0.6rem 0.75rem;border-radius:6px">
+  <strong>{{ placeholder_count }} row{{ 's' if placeholder_count != 1 }} in this queue have no useful Apollo data</strong>
+  (first &amp; last name are both blank / N/A). They can't be outreached to either way — auto-N them in one click.
+  <form method="POST" action="{{ url_for('stage5_clear_placeholders', project_id=project.id) }}"
+        style="display:inline;margin-left:0.5rem"
+        onsubmit="return confirm('Auto-N {{ placeholder_count }} row(s) with no Apollo data?');">
+    <button type="submit" class="btn btn-primary" style="font-size:0.82rem;padding:0.25rem 0.7rem">
+      Auto-N {{ placeholder_count }} row{{ 's' if placeholder_count != 1 }}
+    </button>
+  </form>
+</div>
+{% endif %}
+
+{% if not queue %}
+<div class="stage-card">
+  <p>No rows require review. <a href="{{ url_for('project_detail', project_id=project.id) }}">Go back</a>.</p>
+</div>
+{% else %}
+<!-- Toolbar sits OUTSIDE the main review form so the retry-Gemini form (a
+     nested form is invalid HTML and silently breaks the main Submit). Buttons
+     reach into #review-form via JS where needed. -->
+<div class="review-toolbar">
+  <div class="bulk-group">
+    <span class="bulk-label">Mark all visible:</span>
+    <button type="button" class="btn-small" onclick="markAll('Y')">Y</button>
+    <button type="button" class="btn-small" onclick="markAll('T')">T</button>
+    <button type="button" class="btn-small" onclick="markAll('N')">N</button>
+    {% if gemini_count %}
+    <button type="button" class="btn-small" onclick="acceptAllGemini()"
+            title="Reset each row's pick to Gemini's recommendation, then submit"
+            style="border-color:#1e40af;color:#1e40af">
+      Accept Gemini's picks for {{ gemini_count }} row{{ 's' if gemini_count != 1 }}
+    </button>
+    {% endif %}
+    <span class="kbd-hint">Or focus a row and press <kbd>Y</kbd> / <kbd>T</kbd> / <kbd>N</kbd></span>
+  </div>
+  {% if failed_count %}
+  <form method="POST" action="{{ url_for('stage5_retry_gemini', project_id=project.id) }}"
+        style="display:inline;margin:0" onsubmit="return confirm('Retry Gemini on {{ failed_count }} failed row(s)?');">
+    <button type="submit" class="btn btn-secondary" style="font-size:0.82rem">
+      Retry Gemini on {{ failed_count }} failed row{{ 's' if failed_count != 1 }}
+    </button>
+  </form>
+  {% endif %}
+</div>
+
+<form method="POST" action="{{ url_for('stage5_submit_review', project_id=project.id) }}" id="review-form">
+  <div class="stage-card" style="padding:0">
+    <table class="table review-table">
+      <thead>
+        <tr>
+          <th>Unique ID</th>
+          <th>Officer name (CH)</th>
+          <th>Apollo (first &amp; last)</th>
+          <th>Company</th>
+          <th title="rapidfuzz token_sort_ratio, 0-100">Score</th>
+          <th>Gemini</th>
+          <th>Source</th>
+          <th style="min-width:160px">Decision</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in queue %}
+        <tr tabindex="0" data-uid="{{ row.unique_id }}"
+            data-gemini="{{ row.label if row.source == 'Gemini low-conf' and row.label in ['Y','T','N'] else '' }}">
+          <td><code style="font-size:0.78rem">{{ row.unique_id }}</code></td>
+          <td>{{ row.officer_name }}</td>
+          <td>
+            {% if row.apollo_first or row.apollo_last %}
+              {{ row.apollo_first }}{% if row.apollo_last %} <strong>{{ row.apollo_last }}</strong>{% endif %}
+              {% if not row.apollo_last %}<span style="color:#999;font-size:0.78rem">(no surname)</span>{% endif %}
+            {% else %}
+              <span style="color:#999">—</span>
+            {% endif %}
+          </td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+              title="{{ row.company_name }}">{{ row.company_name }}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums">
+            {% if row.fuzzy_score is not none %}{{ "%.0f"|format(row.fuzzy_score * 100) }}{% else %}—{% endif %}
+          </td>
+          <td>
+            {% if row.source == 'Gemini low-conf' and row.label %}
+            <span class="badge {% if row.label == 'Y' %}badge-complete{% elif row.label == 'N' %}badge-error{% else %}badge-running{% endif %}"
+                  title="{{ row.reason }}">
+              {{ row.label }}{% if row.confidence %} {{ "%.0f%%"|format(row.confidence * 100) }}{% endif %}
+            </span>
+            {% else %}
+            <span style="color:#999;font-size:0.78rem">—</span>
+            {% endif %}
+          </td>
+          <td>
+            <span class="source-tag source-{{ row.source | replace(' ', '_') | lower }}">
+              {{ row.source }}
+            </span>
+          </td>
+          <td>
+            <div class="radio-group">
+              <label class="radio-label">
+                <input type="radio" name="decision_{{ row.unique_id }}" value="Y"
+                       {% if row.label == 'Y' and row.source == 'Gemini low-conf' %}checked{% endif %}> Y
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="decision_{{ row.unique_id }}" value="T"
+                       {% if not row.label or row.label == 'T' or row.source != 'Gemini low-conf' %}checked{% endif %}> T
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="decision_{{ row.unique_id }}" value="N"
+                       {% if row.label == 'N' and row.source == 'Gemini low-conf' %}checked{% endif %}> N
+              </label>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="actions" style="margin-top:1rem">
+    <button type="submit" class="btn btn-primary">Submit decisions &amp; continue</button>
+    <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn btn-secondary">Cancel</a>
+  </div>
+</form>
+{% endif %}
+
+<style>
+.review-table th, .review-table td { font-size: 0.82rem; }
+.review-table tr:focus { outline: 2px solid #1a1a2e; outline-offset: -2px; background: #f3f4f6; }
+.radio-group { display: flex; gap: 0.5rem; }
+.radio-label {
+  display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer;
+  font-weight: 600; padding: 0.2rem 0.45rem; border-radius: 4px;
+  border: 1px solid #ddd; font-size: 0.8rem;
+}
+.radio-label:has(input:checked) { background: #1a1a2e; color: #fff; border-color: #1a1a2e; }
+
+.review-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; margin-bottom: 0.75rem; flex-wrap: wrap;
+}
+.bulk-group { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.bulk-label { font-size: 0.82rem; color: #555; font-weight: 600; }
+.btn-small {
+  padding: 0.25rem 0.65rem; border-radius: 4px; border: 1px solid #1a1a2e;
+  background: #fff; color: #1a1a2e; font-weight: 700; cursor: pointer; font-size: 0.82rem;
+}
+.btn-small:hover { background: #1a1a2e; color: #fff; }
+.kbd-hint { font-size: 0.78rem; color: #777; margin-left: 0.5rem; }
+kbd {
+  background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 3px;
+  padding: 0.05rem 0.3rem; font-size: 0.75rem; font-family: monospace;
+}
+
+.source-tag {
+  font-size: 0.72rem; padding: 0.1rem 0.4rem; border-radius: 3px;
+  background: #f3f4f6; color: #555; white-space: nowrap;
+}
+.source-gemini_error { background: #fee2e2; color: #991b1b; }
+.source-no_gemini    { background: #fed7aa; color: #9a3412; }
+.source-gemini_low-conf { background: #fef9c3; color: #713f12; }
+</style>
+
+<script>
+function markAll(value) {
+  document.querySelectorAll('#review-form input[type=radio]').forEach(r => {
+    if (r.value === value) r.checked = true;
+  });
+}
+
+function acceptAllGemini() {
+  const rows = document.querySelectorAll('#review-form tbody tr');
+  let touched = 0;
+  rows.forEach(tr => {
+    const pick = tr.dataset.gemini;
+    if (!pick) return;  // Gemini errored / no key for this row — leave as-is
+    const uid = tr.dataset.uid;
+    const radio = tr.querySelector(`input[name="decision_${uid}"][value="${pick}"]`);
+    if (radio) { radio.checked = true; touched++; }
+  });
+  if (!confirm(`Submit ${touched} row(s) with Gemini's recommendation? Other rows keep their current selection.`)) return;
+  document.getElementById('review-form').submit();
+}
+
+// Keyboard shortcuts: with a row focused, press Y/T/N to set its decision
+// and advance focus to the next row. Speeds up large manual queues.
+document.querySelectorAll('#review-form tbody tr').forEach(tr => {
+  tr.addEventListener('keydown', (e) => {
+    const key = e.key.toUpperCase();
+    if (!['Y', 'T', 'N'].includes(key)) return;
+    const uid = tr.dataset.uid;
+    const radio = tr.querySelector(`input[name="decision_${uid}"][value="${key}"]`);
+    if (radio) {
+      radio.checked = true;
+      e.preventDefault();
+      const next = tr.nextElementSibling;
+      if (next) next.focus();
+    }
+  });
+});
+</script>
+{% endblock %}

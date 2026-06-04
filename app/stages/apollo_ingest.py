@@ -129,6 +129,12 @@ def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progres
 
     log(f"Apollo result: {len(apollo):,} rows, columns: {list(apollo.columns[:6])}...")
 
+    # See ingest_multiple: read enrichment from Apollo's ".1" copy when the
+    # uploaded header collides, so we don't fabricate Apollo data from the
+    # preserved upload columns. Matching below still uses the preserved columns.
+    apollo_src = {c: (f"{c}.1" if f"{c}.1" in apollo.columns else c)
+                  for c in APOLLO_RAW_COLS if c in apollo.columns or f"{c}.1" in apollo.columns}
+
     uid_matched = 0
     name_matched = 0
     unmatched = 0
@@ -159,8 +165,9 @@ def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progres
             continue
 
         for raw_col, internal_col in zip(APOLLO_RAW_COLS, APOLLO_INTERNAL_COLS):
-            if raw_col in apollo.columns:
-                val = str(row.get(raw_col, "")).strip()
+            src_col = apollo_src.get(raw_col)
+            if src_col:
+                val = str(row.get(src_col, "")).strip()
                 if val:  # don't overwrite a pre-populated value with a blank
                     master.at[idx, internal_col] = val
 
@@ -229,6 +236,13 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
             continue
         total += len(apollo)
         log(f"  {os.path.basename(path)}: {len(apollo):,} rows")
+        # Apollo's enriched columns come AFTER the preserved upload columns; on a
+        # header collision (Apollo also emits "First Name"/"Company Name") pandas
+        # suffixes the Apollo copy ".1". Read enrichment from that copy — otherwise
+        # we pull the uploaded CH value into the Apollo field and fabricate Apollo
+        # data for rows Apollo never matched. (Matching below uses preserved cols.)
+        apollo_src = {c: (f"{c}.1" if f"{c}.1" in apollo.columns else c)
+                      for c in APOLLO_RAW_COLS if c in apollo.columns or f"{c}.1" in apollo.columns}
         file_matched = 0
         file_uid_matched = 0
         file_name_matched = 0
@@ -256,8 +270,9 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
                 continue
 
             for raw, internal in zip(APOLLO_RAW_COLS, APOLLO_INTERNAL_COLS):
-                if raw in apollo.columns:
-                    val = str(row.get(raw, "")).strip()
+                src = apollo_src.get(raw)
+                if src:
+                    val = str(row.get(src, "")).strip()
                     if val:  # don't overwrite pre-populated value with blank
                         master.at[idx, internal] = val
             matched += 1

@@ -51,16 +51,37 @@ LE1–LE5") and status notes — just not for moving files.
 
 ---
 
-## Running it
+## How you'll use it day-to-day
 
-Every stage is one command, run from the `app/` folder:
+Two surfaces, one job each:
 
-```bash
-cd app && python3 ../cchq-orchestrator/scripts/run_stage.py --region LE1 <stage> [options]
-```
+- **Tell the assistant (primary).** In Claude Code, just say what you want —
+  "build the LE1 list", "an Apollo export landed in the inbox", "where's SW1 up
+  to?". It runs the stages, picks files up from the `CCHQ Pipeline Inbox` Drive
+  folder, and pings you (desktop/phone) **only when it needs you** — Apollo
+  upload, VoteSource send, or "done". To let it run unattended, start the loop:
 
-Each command prints its progress and ends with `OK <stage>` when it worked.
-Run `status` any time to see what's done and which files exist.
+  ```
+  /loop 30m Run one tick of the cchq-orchestrator loop per cchq-orchestrator/references/loop_runbook.md.
+  ```
+
+- **Open the web app to look (review).** To eyeball the data, check a project's
+  progress, or spot-check the classifier's decisions:
+
+  ```bash
+  cd app && python3 app.py        # then open http://localhost:5050
+  ```
+
+  Both surfaces share the same projects and files — a list the assistant built
+  shows up in the web app, and vice versa.
+
+You normally won't touch the command line yourself: the assistant drives the
+engine (`run_stage.py`) for you. The table below is just so you can see what's
+happening under the hood.
+
+## Under the hood — the 8 stages (the assistant runs these for you)
+
+Each stage is one command (`cd app && python3 ../cchq-orchestrator/scripts/run_stage.py --region LE1 <stage>`); it prints progress and ends with `OK <stage>`. Run `status` any time to see where a project is.
 
 | Stage | Command | What it does |
 |---|---|---|

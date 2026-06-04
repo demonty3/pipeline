@@ -21,7 +21,7 @@ to confirm which `master_<REGION>_*.csv` exists before advancing.
 |-------------|------------------------------------|-----------------|
 | 2 merge     | `master_<RC>_raw.csv`              | `Unique ID` + 26 CH cols + `SIC Industry`, `Directorships`, `Apollo Duplicate` |
 | 4 ingest    | `master_<RC>_enriched.csv`         | + 22 `Apollo <col>` columns |
-| 5 classify  | `master_<RC>_classified.csv`       | + `Match?` / `Result` (Y / T / N) |
+| 5 classify  | `master_<RC>_classified.csv`       | + `Result` (Y / T / N) |
 | 6 vs-return | `master_<RC>_vs.csv`               | + whatever columns the VoteSource return carried |
 | 7 re-flag   | `master_<RC>_re_flagged.csv`       | + `RE Match?`, `Potential`, `Match?` |
 | 8 export    | `<RC>_final_deliverable.xlsx`      | multi-tab, reshaped to v3 layout (see below) |

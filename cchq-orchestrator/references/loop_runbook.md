@@ -6,19 +6,27 @@ as the deterministic + Gemini stages allow, and records state locally. Keep each
 tick cheap and idempotent — most ticks will find nothing new and exit fast.
 
 State files (under `cchq-orchestrator/state/`):
-- `processed_threads.json` — `processed_thread_ids` already handled. Skip these.
+- `processed_threads.json` — `processed_thread_ids` (Gmail) and `processed_file_ids`
+  (Drive intake folder) already handled. Skip these.
 - `status.md` — append-only human-readable log of what each tick did and any
   checkpoint that needs a person (since we can't email — see connector note).
 
 ## Per-tick steps
 
-1. **Poll.** `search_threads` with:
-   `from:c.ames@cloudmundi.com newer_than:3d (has:attachment OR Apollo OR VoteSource OR "Raiser" OR postcode OR results OR enriched)`
-   Drop any thread whose id is in `processed_thread_ids`. If none remain, append
-   a one-line "nothing new" entry to `status.md` and finish the tick.
+1. **Poll two sources.**
+   - **Drive intake folder (data files).** `search_files` for new CSV/XLSX in the
+     "CCHQ Pipeline Inbox" folder; skip ids already in `processed_file_ids`.
+   - **Gmail (triggers/signals).** `search_threads` with
+     `from:c.ames@cloudmundi.com newer_than:3d (Apollo OR VoteSource OR "Raiser" OR postcode OR results OR enriched OR has:drive)`;
+     drop thread ids already in `processed_thread_ids`.
+   If both come up empty, append a one-line "nothing new" entry to `status.md`
+   and finish the tick.
 
-2. **Read & identify.** For each new thread, `get_thread` (FULL_CONTENT). Decide
-   what it carries, by content — not filename — using `schema_contract.md`:
+2. **Read & identify.** Data files come from the **Drive intake folder**, not
+   email attachments (the connector can't download attachment bytes — see
+   connector note). For Gmail triggers, `get_thread` (FULL_CONTENT). For each new
+   file/thread decide what it carries by content — not filename (Apollo exports
+   are random-hash-named) — using `schema_contract.md`:
    - Drive-linked data file → note the Drive file id from the link and pull it
      with the Drive MCP (`download_file_content` / `read_file_content`).
    - Apollo enriched CSV (22 Apollo cols) → Stage 4 `ingest`.
@@ -45,7 +53,11 @@ State files (under `cchq-orchestrator/state/`):
 
 `search_threads` / `get_thread` / `list_labels` work. `create_label`,
 `label_thread`, and `create_draft` return "insufficient authentication scopes",
-so the loop cannot label threads or send mail. Until write scope is granted:
+so the loop cannot label threads or send mail. Also, `get_thread` returns
+attachments as metadata only (`filename`/`id`/`mimeType`) — there is no tool to
+download attachment bytes, so inbound data files come from the **Drive intake
+folder** ("CCHQ Pipeline Inbox"), read via the Drive MCP, rather than from email.
+Until write scope is granted:
 - **Idempotency** uses `processed_threads.json`, not `CCHQ/*` labels.
 - **Status / deliverable hand-off** is written to `status.md` (and the
   deliverable XLSX sits in the project folder) instead of being emailed.

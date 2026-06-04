@@ -71,7 +71,7 @@ from stages.apollo_ingest import ingest_multiple  # noqa: E402
 from stages.classifier import run_passes_1_and_2, apply_decisions_and_save  # noqa: E402
 from stages.vs_export import build_vs_export  # noqa: E402
 from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save  # noqa: E402
-from stages.exporter import build_export  # noqa: E402
+from stages.exporter import build_export, _pick_master  # noqa: E402
 
 
 def log(msg):
@@ -105,6 +105,24 @@ def require_env(key):
 
 # ── Stage handlers ──────────────────────────────────────────────────────────
 
+def _warn_if_blank(path, column, label, threshold=0.20):
+    """Warn loudly if a load-bearing column is largely blank. Catches a Stage-1
+    pull that silently returned no company names (one SW1 demo area came back
+    0/441) — Company Name drives Apollo name-matching and the deliverable, so a
+    blank column quietly degrades downstream output with no other signal."""
+    import pandas as pd
+    if not os.path.exists(path):
+        return
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    if column not in df.columns or len(df) == 0:
+        return
+    blank = int((df[column].astype(str).str.strip() == "").sum())
+    if blank and blank / len(df) > threshold:
+        log(f"WARNING: {label}: {blank:,}/{len(df):,} rows ({blank/len(df)*100:.0f}%) "
+            f"have a blank '{column}'. This degrades Apollo name-matching and the "
+            f"deliverable — check the Companies House pull for this area.")
+
+
 def stage_fetch(pid, pdir, region, args):
     api_key = require_env("CH_API_KEY")
     area = args.area or region
@@ -112,17 +130,29 @@ def stage_fetch(pid, pdir, region, args):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"results_{area}.csv")
     n = fetch_postcode(area, api_key, out_path, progress_cb=log)
+    _warn_if_blank(out_path, "Company Name", f"fetch {area}")
     db.update_stage1_status(pid, "complete")
     log(f"OK fetch — {area}: {n} rows -> {out_path}")
 
 
 def stage_merge(pid, pdir, region, args):
-    start = db.get_project(pid).get("unique_id_counter", 0) or 0
+    raw_path = os.path.join(pdir, f"master_{region}_raw.csv")
+    if os.path.exists(raw_path) and not args.force:
+        log(f"ERROR: {os.path.basename(raw_path)} already exists. Re-running merge "
+            f"reassigns every Unique ID, which orphans the Stage 5/7 decisions keyed "
+            f"to the old IDs and breaks the deliverable's join. Pass --force to rebuild "
+            f"from scratch (Unique IDs restart at #{region}-0001). If you only added "
+            f"new postcodes, use the app's Unique-ID backfill/repair instead.")
+        sys.exit(2)
+    # On a forced rebuild restart the counter, so the same input yields the same
+    # IDs; otherwise continue from the project's last-used counter.
+    start = 0 if args.force else (db.get_project(pid).get("unique_id_counter", 0) or 0)
     rows, new_counter = run_merge(
         pdir, region, id_prefix=args.id_prefix or region,
         starting_counter=start, progress_cb=log,
     )
     db.set_unique_id_counter(pid, new_counter)
+    _warn_if_blank(raw_path, "Company Name", f"merge {region}")
     db.update_stage2_status(pid, "complete")
     log(f"OK merge — {rows} rows, Unique IDs through #{region}-{new_counter:04d}")
 
@@ -202,7 +232,17 @@ def stage_vs_return(pid, pdir, region, args):
         sys.exit(2)
     drop = [c for c in vs.columns if not c or (isinstance(c, str) and c.startswith("Unnamed:"))]
     vs = vs.drop(columns=drop) if drop else vs
+    # A duplicated Unique ID in the return file would multiply master rows on the
+    # left-merge below, breaking the "never re-order or filter rows" contract.
+    dup_ct = int(vs["Unique ID"].duplicated().sum())
+    if dup_ct:
+        log(f"WARNING: VS return has {dup_ct} duplicate Unique ID row(s); "
+            f"keeping the first of each")
+        vs = vs.drop_duplicates(subset="Unique ID", keep="first")
     classified = os.path.join(pdir, f"master_{region}_classified.csv")
+    if not os.path.exists(classified):
+        log(f"ERROR: {os.path.basename(classified)} not found — run Stage 5 (classify) first.")
+        sys.exit(2)
     master = pd.read_csv(classified, dtype=str, keep_default_na=False)
     new_cols = [c for c in vs.columns if c != "Unique ID" and c not in master.columns]
     master = master.merge(vs[["Unique ID"] + new_cols], on="Unique ID", how="left")
@@ -245,14 +285,9 @@ def stage_summary(pid, pdir, region, args):
     Gmail create_draft tool once compose scope is granted; until then the text
     sits locally so nothing is lost. Pure read — never mutates the pipeline."""
     import pandas as pd
-    from stages.exporter import MASTER_SUFFIXES
-    master_path = None
-    for suffix in MASTER_SUFFIXES:
-        cand = os.path.join(pdir, f"master_{region}_{suffix}.csv")
-        if os.path.exists(cand):
-            master_path = cand
-            break
-    if not master_path:
+    try:
+        master_path, _ = _pick_master(pdir, region)
+    except FileNotFoundError:
         log("ERROR: no master file — run at least Stage 2 first.")
         sys.exit(2)
     m = pd.read_csv(master_path, dtype=str, keep_default_na=False)
@@ -321,6 +356,9 @@ def main():
     ap.add_argument("--budget", type=int, help="Apollo credit budget cap for `magazine`")
     ap.add_argument("--files", nargs="+", help="Apollo enriched CSV(s) for `ingest`")
     ap.add_argument("--file", help="Single input file for `vs-return` / `re-flag`")
+    ap.add_argument("--force", action="store_true",
+                    help="For `merge`: rebuild from scratch even if a master "
+                         "already exists (Unique IDs restart at 0001).")
     args = ap.parse_args()
 
     region = args.region.upper()

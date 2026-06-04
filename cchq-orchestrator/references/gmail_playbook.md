@@ -34,7 +34,17 @@ Use Gmail labels as the run's state board so background pickups are idempotent:
 
 ---
 
-## Role 1 — Receive input files (inbound attachments → project folder)
+## Role 1 — Receive input files (inbound data files → project folder)
+
+> **⚠ File transport is a Drive intake folder, not email.** The Gmail connector
+> returns attachments as metadata only (`filename`, `id`, `mimeType`) — there is
+> no tool to fetch the bytes — and the Apollo enriched export comes straight from
+> Apollo (the vendor), so it can't be reshaped into a link from Charles.
+> Therefore inbound data files live in a dedicated **Google Drive intake folder**
+> (e.g. "CCHQ Pipeline Inbox") that Charles saves files into; the loop reads them
+> with the Drive MCP (`search_files` / `read_file_content`). Gmail is for
+> triggers/signals only. And because Apollo's exports are random-hash-named (e.g.
+> `a3fb8aaa….csv`), **identify every file by its column schema, never its name.**
 
 Inbound files map to specific stages by shape:
 
@@ -47,12 +57,13 @@ Inbound files map to specific stages by shape:
 
 Procedure:
 1. `search_threads` for unprocessed inputs, e.g.
-   `from:c.ames@cloudmundi.com has:attachment -label:CCHQ/processed newer_than:30d`.
+   `from:c.ames@cloudmundi.com (has:drive OR has:attachment) -label:CCHQ/processed newer_than:30d`.
 2. Identify the file by the **schema_contract** (count/parse the header row to
    tell an Apollo export from a VS return from an RE list — don't guess from
    the filename alone).
-3. Save the attachment into the project folder (or `postcodes/` for CH files),
-   run the matching stage, confirm the `OK <stage>` line.
+3. Read the file from the Drive intake folder with the Drive MCP and save it
+   into the project folder (or `postcodes/` for CH files), run the matching
+   stage, and confirm the `OK <stage>` line.
 4. `label_thread` → `CCHQ/processed` (and remove `CCHQ/inbound`).
 
 ## Role 2 — Trigger runs (a new event request kicks off a pipeline)

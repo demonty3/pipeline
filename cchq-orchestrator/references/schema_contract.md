@@ -1,0 +1,116 @@
+# Schema contract — the load-bearing format
+
+Every stage adds columns to a single master table **without re-ordering or
+filtering rows**. The `Unique ID` (`#LE1-0001` style) is the join key the whole
+pipeline hangs on. If a column name, column order, or the spacer/echo layout
+drifts, downstream joins silently mis-merge and the Treasurers' deliverable
+stops matching the format they know. This file is the source of truth for that
+format. It was reconciled against the real golden files in Drive
+(`Leicester - Data v1.xlsx` Sheet1 and `Leicester - Data v3.xlsx` ALL tab) and
+the stage code (`app/stages/merge.py`, `apollo_ingest.py`, `exporter.py`).
+
+**Rule of thumb before running any stage:** the input file must already carry
+the columns the previous stage was supposed to add. Use `run_stage.py status`
+to confirm which `master_<REGION>_*.csv` exists before advancing.
+
+---
+
+## Master file lineage (one file per stage, never overwritten in place)
+
+| After stage | File written                       | Columns it adds |
+|-------------|------------------------------------|-----------------|
+| 2 merge     | `master_<RC>_raw.csv`              | `Unique ID` + 26 CH cols + `SIC Industry`, `Directorships`, `Apollo Duplicate` |
+| 4 ingest    | `master_<RC>_enriched.csv`         | + 22 `Apollo <col>` columns |
+| 5 classify  | `master_<RC>_classified.csv`       | + `Match?` / `Result` (Y / T / N) |
+| 6 vs-return | `master_<RC>_vs.csv`               | + whatever columns the VoteSource return carried |
+| 7 re-flag   | `master_<RC>_re_flagged.csv`       | + `RE Match?`, `Potential`, `Match?` |
+| 8 export    | `<RC>_final_deliverable.xlsx`      | multi-tab, reshaped to v3 layout (see below) |
+
+Stage 8 reads the **most enriched** master that exists
+(`re_flagged > vs > classified > enriched > raw`), so a partial pipeline still
+produces a usable file.
+
+---
+
+## The 26 Companies House columns (exact order — from `merge.py`)
+
+```
+Surname, First Name, Middle Names, Officer name, Officer occupation,
+Officer role, Officer nationality, Officer date of birth,
+Officer address line one, Officer address locality, Officer address country,
+Officer address post code, Officer country of residence,
+Officer appointment date, Appointment, Officer resignation date,
+Company Name, Company Number, Company Status, Company Type,
+Company date of creation, Company address line one, Company address locality,
+Company address country, Company address post code, Company SIC codes
+```
+
+`Unique ID` sits **first**, before this block. After the block, merge appends
+its three internal columns: `SIC Industry`, `Directorships`, `Apollo Duplicate`.
+
+- **Directorships** — count of (Surname, First Name) across the region.
+- **Apollo Duplicate** — `True` for repeat persons by (Surname, First Name,
+  Officer date of birth). Stage 3 uploads only the `False` rows (dedup saves
+  the redundant Apollo lookups).
+
+## The 22 Apollo columns (exact Apollo export names — from `apollo_ingest.py`)
+
+```
+First Name, Last Name, Title, Person Linkedin Url, City, State, Country,
+Email, Company Name, Website, Industry, # Employees, Annual Revenue,
+Total Funding, Company Phone, Company Linkedin Url, Company Street,
+Company City, Company Postal Code, Company State, Company Country,
+Company Founded Year
+```
+
+In the master these are stored **prefixed** as `Apollo First Name`,
+`Apollo Email`, etc. — the prefix prevents collisions with the CH columns of
+the same name (`Company Name`, `First Name`...). Stage 8 strips the prefix on
+the way out so the deliverable shows the raw Apollo names.
+
+**Ingest join order:** Unique ID first, then a `(Surname, First Name,
+normalised Company Name)` fallback for files whose IDs don't line up (e.g. an
+Apollo export run from a different operator's account). Company names are
+normalised through `clean_company_name()` on both sides so a raw CH name
+matches Apollo's already-cleaned name.
+
+## Classifier / RE-flagger columns
+
+- Stage 5 writes `Result` ∈ {`Y`, `T`, `N`}. Cascade: deterministic fuzzy
+  score (≥85 → Y, <45 → N, middle → Tentative) → Gemini judges the Tentative
+  band in batches → only Gemini-low-confidence rows reach human review.
+- Stage 7 writes `RE Match?` (`Y`/blank), `Potential`, and `Match?`. Same
+  deterministic → Gemini → human cascade against the Raiser's Edge name list.
+
+---
+
+## Stage 8 deliverable layout (the v3 shape — DO NOT drift)
+
+Matches `Leicester - Data v3.xlsx` exactly. Three tabs:
+
+- **ALL** — every row, full column set below.
+- **Y&T** — rows where `Result` ∈ {`Y`, `T`}.
+- **Potential RE Match** — rows where `RE Match?` == `Y`.
+
+Column order on every tab (note the deliberate **blank spacer columns** and the
+**echo copies** of Surname / First Name / Company Name that sit between the CH
+block and the Apollo block — the Treasurers' sheet has always looked like this):
+
+```
+Unique ID,
+<23 CH display cols: Surname … Company SIC codes>,   (note: drops Officer role,
+                                                       Appointment, Officer
+                                                       resignation date vs the
+                                                       26-col master)
+<blank>, <blank>,
+RE Match?, Potential, <blank>, Match?,
+Surname (echo), First Name (echo), Company Name (echo), Result,
+<22 Apollo cols, prefix stripped: First Name … Company Founded Year>
+```
+
+Sort: by CH `Company Name`, case-insensitive, before the rename step (because
+post-rename there are duplicate `Company Name` labels across the CH / echo /
+Apollo groups).
+
+**If you change anything in this file, regenerate one project end-to-end and
+diff the Stage 8 output against `Leicester - Data v3.xlsx` before shipping.**

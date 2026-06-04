@@ -1,0 +1,1 @@
+{"processed_thread_ids": ["19e20831590e936f"], "notes": "19e20831590e936f = the CloudMundi bootstrap thread (source docs + Gemini key), already reflected in app/.env and the schema. The loop skips these."}

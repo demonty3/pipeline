@@ -22,3 +22,6 @@ venv/
 # Editors / IDEs
 .vscode/
 .idea/
+
+# cchq-orchestrator runtime state (per-run, not for source control)
+cchq-orchestrator/state/

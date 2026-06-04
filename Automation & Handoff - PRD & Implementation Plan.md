@@ -60,6 +60,7 @@ golden regression test (needs the SW3 files).
 | D3 | **Gmail used for triggers/signals only** | Read-only scopes today; file transport moved to Drive. |
 | D4 | **Stages 5 & 7 run autonomously** (Gemini auto-accepted, every decision logged) | Throughput; audit trail in `classifications_log.csv` + `stage{5,7}_autoresolved_<RC>.csv` keeps it safe. |
 | D5 | **Schema continuity is load-bearing** | Deliverable must stay shape-compatible with `Leicester - Data v3.xlsx`. |
+| D6 | **Charles's primary surface = the Claude Code agent + loop; Flask app = review/eyeball; CLI = engine** | Only the agent surface delivers the automation (intake, notifications, autonomous stages). Requires Gmail+Drive connectors authed in Charles's environment. |
 
 ## 5. Requirements
 

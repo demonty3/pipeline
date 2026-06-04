@@ -76,11 +76,16 @@ matches Apollo's already-cleaned name.
 
 ## Classifier / RE-flagger columns
 
-- Stage 5 writes `Result` ∈ {`Y`, `T`, `N`}. Cascade: deterministic fuzzy
-  score (≥85 → Y, <45 → N, middle → Tentative) → Gemini judges the Tentative
-  band in batches → only Gemini-low-confidence rows reach human review.
-- Stage 7 writes `RE Match?` (`Y`/blank), `Potential`, and `Match?`. Same
-  deterministic → Gemini → human cascade against the Raiser's Edge name list.
+These are the **internal master** columns; the Stage 8 deliverable remaps them to
+the golden v3 format (see the mapping note below).
+
+- Stage 5 writes `Result` ∈ {`Y`, `T`, `N`} — the sanity check (does the Apollo
+  contact match the CH officer). Cascade: deterministic fuzzy score (≥85 → Y,
+  <45 → N, middle → Tentative) → Gemini judges the Tentative band in batches →
+  only Gemini-low-confidence rows reach human review.
+- Stage 7 writes `RE Match?` (`Y`/blank), `Potential`, and an internal `Match?`
+  (confirmed/tentative/human). Same deterministic → Gemini → human cascade against
+  the Raiser's Edge name list.
 
 ---
 
@@ -89,7 +94,8 @@ matches Apollo's already-cleaned name.
 Matches `Leicester - Data v3.xlsx` exactly. Three tabs:
 
 - **ALL** — every row, full column set below.
-- **Y&T** — rows where `Result` ∈ {`Y`, `T`}.
+- **Y&T** — rows where the sanity check is Yes/Tentative (deliverable `Match?` ∈
+  {`Yes`, `Tentative`}; internally `Result` ∈ {`Y`, `T`}).
 - **Potential RE Match** — rows where `RE Match?` == `Y`.
 
 Column order on every tab (note the deliberate **blank spacer columns** and the
@@ -107,6 +113,13 @@ RE Match?, Potential, <blank>, Match?,
 Surname (echo), First Name (echo), Company Name (echo), Result,
 <22 Apollo cols, prefix stripped: First Name … Company Founded Year>
 ```
+
+**Golden value mapping (applied at export only — the master keeps `Y`/`T`/`N`).**
+Confirmed against the real `Leicester - Data v3.xlsx` cells (7,244 rows): the
+deliverable's **`Match?`** column holds the *sanity check* as `Yes` / `No` /
+`Tentative` (mapped from the master's `Result`), and the **`Result`** column holds
+`Matched` / `N/A` (whether Apollo returned a contact). The RE-flagger's internal
+confirmed/human level is NOT shown — RE lives in `RE Match?` / `Potential`.
 
 Sort: by CH `Company Name`, case-insensitive, before the rename step (because
 post-rename there are duplicate `Company Name` labels across the CH / echo /

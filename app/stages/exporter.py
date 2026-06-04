@@ -45,8 +45,6 @@ FINAL_CH_COLS = [
     "Company SIC codes",
 ]
 
-FINAL_RE_COLS = ["RE Match?", "Potential", "Match?"]
-
 FINAL_ECHO_COLS = ["Surname", "First Name", "Company Name"]  # echo copies
 
 FINAL_APOLLO_DISPLAY = [
@@ -104,52 +102,41 @@ def build_export(project_dir, region_code, progress_cb=None):
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     log(f"  {len(master):,} rows loaded")
 
-    # ── Build output DataFrame ────────────────────────────────────────────────
-    # We assemble columns in the correct order, inserting blanks for missing ones.
-    out = pd.DataFrame()
-    out["Unique ID"] = master.get("Unique ID", "")
+    # ── Build output DataFrame (golden v3 column order + values) ──────────────
+    # The deliverable mirrors `Leicester - Data v3.xlsx` exactly so the Treasurers
+    # don't have to learn a new format. Two golden mappings happen *here at export
+    # only* — the pipeline keeps Y/T/N internally:
+    #   - "Match?" column = the sanity check, shown as Yes / Tentative / No
+    #     (mapped from the master's internal Result = Y/T/N).
+    #   - "Result" column = "Matched" if Apollo returned a contact, else "N/A".
+    # The RE-flagger output lives in "RE Match?" / "Potential" (golden's home for
+    # it); the internal RE confidence (confirmed/human) is not shown in the file.
+    n = len(master)
 
+    def mcol(name):
+        return master.get(name, pd.Series([""] * n, index=master.index))
+
+    SANITY_TO_WORD = {"Y": "Yes", "T": "Tentative", "N": "No"}
+    sanity = mcol("Result").map(lambda v: SANITY_TO_WORD.get(str(v).strip(), ""))
+    apollo_present = (mcol("Apollo First Name").astype(str).str.strip() != "") | \
+                     (mcol("Apollo Email").astype(str).str.strip() != "")
+    blank = pd.Series([""] * n, index=master.index)
+
+    cols_out = {"Unique ID": mcol("Unique ID")}
     for col in FINAL_CH_COLS:
-        out[col] = master.get(col, "")
-
-    # Two blank spacer columns (matching v3 layout)
-    out["_blank1"] = ""
-    out["_blank2"] = ""
-
-    for col in FINAL_RE_COLS:
-        out[col] = master.get(col, "")
-
-    # One blank spacer between Potential and Match? (v3 has a gap column)
-    out["_blank3"] = ""
-
-    # Re-apply Match? (already set above but v3 has a gap before it)
-    # Fix: remove the separate RE col loop to set them manually with spacing
-    # (rebuild properly)
-
-    # Rebuild output with correct v3 column ordering
-    cols_out = {}
-    cols_out["Unique ID"] = master.get("Unique ID", pd.Series([""] * len(master)))
-
-    for col in FINAL_CH_COLS:
-        cols_out[col] = master.get(col, pd.Series([""] * len(master)))
-
-    cols_out["_blank1"] = pd.Series([""] * len(master))
-    cols_out["_blank2"] = pd.Series([""] * len(master))
-    cols_out["RE Match?"] = master.get("RE Match?", pd.Series([""] * len(master)))
-    cols_out["Potential"] = master.get("Potential", pd.Series([""] * len(master)))
-    cols_out["_blank3"] = pd.Series([""] * len(master))
-    cols_out["Match?"] = master.get("Match?", pd.Series([""] * len(master)))
-
-    # Echo copies
-    cols_out["_Surname_echo"] = master.get("Surname", pd.Series([""] * len(master)))
-    cols_out["_First_echo"] = master.get("First Name", pd.Series([""] * len(master)))
-    cols_out["_Company_echo"] = master.get("Company Name", pd.Series([""] * len(master)))
-
-    cols_out["Result"] = master.get("Result", pd.Series([""] * len(master)))
-
-    # Apollo enrichment columns (strip prefix for display)
+        cols_out[col] = mcol(col)
+    cols_out["_blank1"] = blank
+    cols_out["_blank2"] = blank
+    cols_out["RE Match?"] = mcol("RE Match?")
+    cols_out["Potential"] = mcol("Potential")
+    cols_out["_blank3"] = blank
+    cols_out["Match?"] = sanity                       # golden: sanity check (Yes/No/Tentative)
+    cols_out["_Surname_echo"] = mcol("Surname")
+    cols_out["_First_echo"] = mcol("First Name")
+    cols_out["_Company_echo"] = mcol("Company Name")
+    cols_out["Result"] = apollo_present.map(lambda x: "Matched" if x else "N/A")
     for internal, display in zip(FINAL_APOLLO_INTERNAL, FINAL_APOLLO_DISPLAY):
-        cols_out[f"_apollo_{display}"] = master.get(internal, pd.Series([""] * len(master)))
+        cols_out[f"_apollo_{display}"] = mcol(internal)
 
     out = pd.DataFrame(cols_out, index=master.index)
 
@@ -185,9 +172,8 @@ def build_export(project_dir, region_code, progress_cb=None):
     _write_sheet(ws_all, out)
     log(f"  Sheet 'ALL': {len(out):,} rows")
 
-    # Sheet 2: Y&T
-    result_col = out.get("Result", pd.Series([""] * len(out)))
-    df_yt = out[out["Result"].isin(["Y", "T"])]
+    # Sheet 2: Y&T — golden filters on the sanity check (Match? = Yes/Tentative)
+    df_yt = out[out["Match?"].isin(["Yes", "Tentative"])]
     ws_yt = wb.create_sheet("Y&T")
     _write_sheet(ws_yt, df_yt)
     log(f"  Sheet 'Y&T': {len(df_yt):,} rows")

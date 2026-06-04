@@ -14,8 +14,11 @@ State files (under `cchq-orchestrator/state/`):
 ## Per-tick steps
 
 1. **Poll two sources.**
-   - **Drive intake folder (data files).** `search_files` for new CSV/XLSX in the
-     "CCHQ Pipeline Inbox" folder; skip ids already in `processed_file_ids`.
+   - **Drive intake folder (data files).** `search_files` with
+     `parentId = '1-fTm5_5WkR5DaCqGM-TmmWpKP7_h1A9D' and (mimeType contains 'csv' or mimeType contains 'spreadsheet') and modifiedTime > '<last-tick-RFC3339>'`;
+     skip ids already in `processed_file_ids`. That id is the `CCHQ Pipeline
+     Inbox` folder (created 2026-06-04; Drive connector verified reads/searches
+     fine). Charles drops inbound files there.
    - **Gmail (triggers/signals).** `search_threads` with
      `from:c.ames@cloudmundi.com newer_than:3d (Apollo OR VoteSource OR "Raiser" OR postcode OR results OR enriched OR has:drive)`;
      drop thread ids already in `processed_thread_ids`.
@@ -40,14 +43,24 @@ State files (under `cchq-orchestrator/state/`):
    gate) — Gemini's call is auto-accepted and logged; report the Y/T/N or
    flag counts.
 
-4. **Record.** Add the thread id to `processed_threads.json`. Append to
+4. **Record.** Add the thread/file id to `processed_threads.json`. Append to
    `status.md`: timestamp, what was processed, the stage result, and any
    checkpoint a person must act on (Apollo upload, VoteSource send, or "review
    the auto-resolved audit CSV if you want to spot-check").
 
-5. **Stop conditions for the tick.** Stage 1 (`fetch`) needs `CH_API_KEY`;
+5. **Notify (only when the operator must act or wants to know).** Call
+   `PushNotification` — it pings the terminal/phone of whoever is running the
+   loop (Charles, post-handoff). Send one ONLY for an event worth interrupting
+   for; stay silent on idle ticks. Triggers and example messages:
+   - Human checkpoint reached → `"CCHQ LE1: 2 Apollo batches ready to upload (apollo_batch_*.csv)"` / `"CCHQ LE1: VoteSource upload ready — vs_export_LE1.xlsx"`
+   - Deliverable built → `"CCHQ LE1 done: 412 Y&T prospects — LE1_final_deliverable.xlsx"`
+   - Blocked → `"CCHQ LE1 blocked: GEMINI_API_KEY not set"` / `"CCHQ: file in inbox didn't match any schema — needs a look"`
+   Keep it one line, lead with the action. No notification for routine "ingested,
+   classified, idle" progress — that's what `status.md` is for.
+
+6. **Stop conditions for the tick.** Stage 1 (`fetch`) needs `CH_API_KEY`;
    Stages 5/7 need `GEMINI_API_KEY`. If a needed key is missing, log it to
-   `status.md` and move on — don't crash the loop.
+   `status.md`, fire the "blocked" notification, and move on — don't crash the loop.
 
 ## Connector note (current Gmail scopes are read-only)
 

@@ -80,6 +80,12 @@ h2 { font-size: 1.1rem; margin: 0; }
 .btn-danger-sm:hover { background: #fee2e2; }
 
 /* Badges */
+.card {
+  background: #fff;
+  border: 1px solid #e2e2e2;
+  border-radius: 6px;
+}
+
 .badge {
   display: inline-block;
   padding: 0.2rem 0.55rem;
@@ -190,6 +196,48 @@ h2 { font-size: 1.1rem; margin: 0; }
   line-height: 1.6;
 }
 .ts { color: #6b7280; margin-right: 0.5rem; }
+
+/* Live terminal — streams the running postcode's full log during a fetch */
+.live-terminal {
+  margin-top: 1rem;
+  background: #1a1a1a;
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+.live-terminal-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  background: #0f0f0f;
+  color: #d4d4d4;
+  font-size: 0.78rem;
+  font-family: monospace;
+  border-bottom: 1px solid #2a2a2a;
+}
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 6px #4ade80;
+  animation: live-pulse 1.4s ease-in-out infinite;
+}
+@keyframes live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+.live-terminal-body {
+  margin: 0;
+  background: #1a1a1a;
+  color: #d4d4d4;
+  padding: 0.75rem;
+  font-family: monospace;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  max-height: 320px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* Misc */
 .empty { color: #666; }

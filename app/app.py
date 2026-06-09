@@ -9,9 +9,11 @@ import re
 import shutil
 import threading
 import tempfile
+import uuid
 import pandas as pd
 from flask import (Flask, render_template, request, redirect, url_for,
                    jsonify, send_file, abort)
+from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
 import database as db
@@ -28,6 +30,7 @@ from stages.re_flagger import (run_re_flagging, apply_re_decisions_and_save,
 from stages import gemini_health
 from stages.exporter import build_export
 from stages.vs_export import build_vs_export
+from stages.credit_chop import chop_for_credits
 
 load_dotenv()
 
@@ -43,6 +46,11 @@ _job_lock = threading.Lock()
 
 # Per-project cancel events — set to signal a running background thread to stop.
 _cancel_events: dict = {}  # project_id → threading.Event
+
+# Credit-chopper output dirs, keyed by a one-time token so the results page can
+# offer the trimmed files for download. Lives only for the app's lifetime.
+_chop_outputs: dict = {}  # token → temp out_dir
+_chop_lock = threading.Lock()
 
 def _job(pid):
     with _job_lock:
@@ -575,6 +583,68 @@ def apollo_credits_route():
                   else "Apollo did not return a recognised credits field")
         return jsonify({"credits_remaining": None, "reason": reason})
     return jsonify({"credits_remaining": credits})
+
+
+# ── Credit chopper (standalone operator tool) ─────────────────────────────────
+
+@app.route("/tools/credit-chop", methods=["GET", "POST"])
+def credit_chop_tool():
+    """
+    Standalone helper: upload any CSV/XLSX + a credit count, get back a file
+    trimmed to fit (never more names than credits, never over Apollo's 10k/file
+    cap) plus the deferred leftover. Not tied to a project — file in, files out.
+    """
+    if request.method == "GET":
+        return render_template("credit_chop.html", result=None, error=None)
+
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return render_template("credit_chop.html", result=None,
+                               error="Choose a CSV or XLSX file to chop.")
+
+    credits = request.form.get("credits", type=int)  # blank → auto-fetch
+    file_cap = request.form.get("file_cap", type=int) or 10_000
+    dedupe = request.form.get("dedupe") == "on"
+
+    # Save the upload under its real name so output files keep a sensible stem.
+    in_dir = tempfile.mkdtemp(prefix="chop_in_")
+    in_path = os.path.join(in_dir, secure_filename(f.filename) or "upload.csv")
+    f.save(in_path)
+    out_dir = tempfile.mkdtemp(prefix="chop_out_")
+
+    try:
+        result = chop_for_credits(in_path, credits=credits, out_dir=out_dir,
+                                  file_cap=file_cap, dedupe=dedupe)
+    except Exception as exc:
+        shutil.rmtree(in_dir, ignore_errors=True)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return render_template("credit_chop.html", result=None, error=str(exc))
+    finally:
+        shutil.rmtree(in_dir, ignore_errors=True)
+
+    token = uuid.uuid4().hex
+    with _chop_lock:
+        _chop_outputs[token] = out_dir
+        # Bound the cache so chopper temp dirs don't accumulate for the app's
+        # whole lifetime — evict and delete the oldest beyond the most recent 20.
+        while len(_chop_outputs) > 20:
+            old_token = next(iter(_chop_outputs))
+            shutil.rmtree(_chop_outputs.pop(old_token), ignore_errors=True)
+
+    return render_template("credit_chop.html", result=result, token=token,
+                           source_name=f.filename, error=None)
+
+
+@app.route("/tools/credit-chop/download/<token>/<path:filename>")
+def credit_chop_download(token, filename):
+    with _chop_lock:
+        out_dir = _chop_outputs.get(token)
+    if not out_dir:
+        abort(404)
+    full = os.path.abspath(os.path.join(out_dir, filename))
+    if not full.startswith(os.path.abspath(out_dir)) or not os.path.exists(full):
+        abort(404)
+    return send_file(full, as_attachment=True)
 
 
 @app.route("/project/<int:project_id>/stage3/mark-sent", methods=["POST"])

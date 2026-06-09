@@ -4,7 +4,10 @@
 {% block content %}
 <div class="page-header">
   <h1>Projects</h1>
-  <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New project</a>
+  <div>
+    <a href="{{ url_for('credit_chop_tool') }}" class="btn btn-secondary">Credit chopper</a>
+    <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New project</a>
+  </div>
 </div>
 
 {% if projects %}

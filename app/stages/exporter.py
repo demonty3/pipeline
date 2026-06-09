@@ -56,6 +56,19 @@ FINAL_APOLLO_DISPLAY = [
 ]
 FINAL_APOLLO_INTERNAL = [f"Apollo {c}" for c in FINAL_APOLLO_DISPLAY]
 
+# VoteSource return columns (the O–AE block of the canonical `vs example.xlsx`),
+# in order. Folded into the master at Stage 6b and appended to the deliverable
+# only when present — so the default file stays identical to the golden v3
+# (no-VS) shape, and gains these exact headers once a VS overlay has returned.
+VS_RETURN_COLS = [
+    "ConstituentId", "ConstituentDateOfBirth", "VSAge", "ConstituentFullName",
+    "CanBeContacted", "CanBeEmailed", "AddressFullName",
+    "LastKnownVotingIntention", "LastKnownVotingIntentionDate", "EmailAddress",
+    "ConstituentEmailDataStatementConsentObtainedEmail", "ConstituentEmailConsentDate",
+    "TelephonePhoneNumber", "ConstituentTelephoneConsentDate",
+    "Mosaic Code 2025", "Household Income Band (2025)", "Personal Income Band (2025)",
+]
+
 
 def _pick_master(project_dir, region_code):
     for suffix in MASTER_SUFFIXES:
@@ -127,7 +140,9 @@ def build_export(project_dir, region_code, progress_cb=None):
         cols_out[col] = mcol(col)
     cols_out["_blank1"] = blank
     cols_out["_blank2"] = blank
-    cols_out["RE Match?"] = mcol("RE Match?")
+    # Golden v3 shows 'Y' for a match and BLANK otherwise — not the literal 'N'
+    # the RE flagger writes into the master for every non-match.
+    cols_out["RE Match?"] = mcol("RE Match?").map(lambda v: "Y" if str(v).strip() == "Y" else "")
     cols_out["Potential"] = mcol("Potential")
     cols_out["_blank3"] = blank
     cols_out["Match?"] = sanity                       # golden: sanity check (Yes/No/Tentative)
@@ -137,6 +152,15 @@ def build_export(project_dir, region_code, progress_cb=None):
     cols_out["Result"] = apollo_present.map(lambda x: "Matched" if x else "N/A")
     for internal, display in zip(FINAL_APOLLO_INTERNAL, FINAL_APOLLO_DISPLAY):
         cols_out[f"_apollo_{display}"] = mcol(internal)
+
+    # VoteSource overlay (Stage 6b): append the canonical vs-example return
+    # columns ONLY when present, so the no-VS deliverable still matches golden v3.
+    vs_present = any(c in master.columns for c in VS_RETURN_COLS)
+    if vs_present:
+        cols_out["_blank_vs"] = blank
+        for c in VS_RETURN_COLS:
+            cols_out[c] = mcol(c)
+        log(f"  VoteSource overlay present — appended {len(VS_RETURN_COLS)} VS column(s)")
 
     out = pd.DataFrame(cols_out, index=master.index)
 
@@ -154,6 +178,7 @@ def build_export(project_dir, region_code, progress_cb=None):
         "_blank1": "",
         "_blank2": "",
         "_blank3": "",
+        "_blank_vs": "",
         "_Surname_echo": "Surname",
         "_First_echo": "First Name",
         "_Company_echo": "Company Name",

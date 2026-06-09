@@ -70,12 +70,20 @@ def build_batches(project_dir, region_code, exclude_dissolved=True,
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     log(f"Loaded master: {len(master):,} rows")
 
-    # ── Deduplicate: only include the primary row for each person ─────────────
+    # ── Region-wide person dedup: one row per unique person ───────────────────
+    # Stage 2 flags every repeat of a person (same Surname|First|DOB) across ALL
+    # postcodes as an Apollo Duplicate. Uploading only the non-duplicates means
+    # each person is enriched once no matter how many companies they direct —
+    # the fewest possible upload rows (and files). Stage 4 then fans the person's
+    # enrichment back across their other rows on the way in.
     if "Apollo Duplicate" in master.columns:
-        upload_list = master[master["Apollo Duplicate"].str.lower() != "true"].copy()
+        dup_mask = master["Apollo Duplicate"].str.lower() == "true"
+        upload_list = master[~dup_mask].copy()
+        log(f"  Region-wide person dedup: {int(dup_mask.sum()):,} duplicate-person rows held back, "
+            f"{len(upload_list):,} unique people to upload")
     else:
         upload_list = master.copy()
-    log(f"  {len(upload_list):,} rows after dedup filter (Apollo Duplicate == False)")
+        log(f"  {len(upload_list):,} rows (no dedup flag present)")
 
     # ── Optional pre-filters ─────────────────────────────────────────────────
     if exclude_dissolved and "Company Status" in upload_list.columns:

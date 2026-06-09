@@ -42,6 +42,66 @@ APOLLO_RAW_COLS = [
 # Internal names used in the master (prefixed to avoid collision).
 APOLLO_INTERNAL_COLS = [f"Apollo {c}" for c in APOLLO_RAW_COLS]
 
+# Of Apollo's 22 columns, these describe the PERSON (not the company they were
+# enriched against). Stage 3 sends only one row per unique person to Apollo, so
+# only that row comes back enriched; we fan THESE fields out to the person's
+# other directorship rows. The remaining (company-level) Apollo fields are NOT
+# fanned out — each duplicate row is a different company, and copying the
+# representative company's data onto it would be misleading.
+PERSON_LEVEL_APOLLO = [
+    "First Name", "Last Name", "Title", "Person Linkedin Url",
+    "City", "State", "Country", "Email",
+]
+
+
+def _fan_out_person_enrichment(master, log):
+    """
+    Copy person-level Apollo fields from each enriched representative row onto
+    the same person's other rows (their other directorships), keyed by
+    (Surname, First Name, Officer date of birth) — the exact key Stage 2 used to
+    pick which rows to upload. Only blank target cells are filled, so this never
+    overwrites real data and is safe to re-run after every batch ingest.
+
+    Returns the number of rows that received fanned-out enrichment.
+    """
+    person_cols = [f"Apollo {c}" for c in PERSON_LEVEL_APOLLO if f"Apollo {c}" in master.columns]
+    needed = {"Surname", "First Name", "Officer date of birth"}
+    if not person_cols or not needed <= set(master.columns):
+        return 0
+
+    key = (master["Surname"].str.strip().str.lower() + "|"
+           + master["First Name"].str.strip().str.lower() + "|"
+           + master["Officer date of birth"].str.strip())
+    has_data = master[person_cols].apply(lambda r: any(str(v).strip() for v in r), axis=1)
+
+    filled = 0
+    for key_val, idxs in master.groupby(key).groups.items():
+        idxs = list(idxs)
+        if len(idxs) < 2:
+            continue
+        # Skip blank-DOB groups: the key collapses to "surname|first|" when DOB is
+        # absent, which would merge DISTINCT same-name people and fan one person's
+        # contact data onto another. Only fan when the DOB component is present.
+        if str(key_val).rsplit("|", 1)[-1].strip() == "":
+            continue
+        donors = [i for i in idxs if has_data[i]]
+        if not donors:
+            continue
+        src = donors[0]
+        for i in idxs:
+            if i == src:
+                continue
+            changed = False
+            for col in person_cols:
+                if not str(master.at[i, col]).strip() and str(master.at[src, col]).strip():
+                    master.at[i, col] = master.at[src, col]
+                    changed = True
+            if changed:
+                filled += 1
+    if filled:
+        log(f"  Fanned out person enrichment to {filled:,} duplicate-person row(s)")
+    return filled
+
 
 def _name_key(surname: str, first_name: str, company_name: str) -> str:
     """
@@ -168,7 +228,9 @@ def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progres
             src_col = apollo_src.get(raw_col)
             if src_col:
                 val = str(row.get(src_col, "")).strip()
-                if val:  # don't overwrite a pre-populated value with a blank
+                # Blank-fill only: never overwrite an existing value, so the same
+                # person enriched in two files is first-wins, not last-wins.
+                if val and not str(master.at[idx, internal_col]).strip():
                     master.at[idx, internal_col] = val
 
     matched = uid_matched + name_matched
@@ -192,6 +254,9 @@ def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progres
         orphan_path = os.path.join(project_dir, f"apollo_orphans_batch{batch_id}.csv")
         pd.DataFrame(orphan_rows).to_csv(orphan_path, index=False)
         log(f"  {unmatched:,} orphan rows written to {os.path.basename(orphan_path)}")
+
+    # Fan person-level enrichment out across each person's other directorships.
+    _fan_out_person_enrichment(master, log)
 
     # Save enriched master
     master.to_csv(enriched_path, index=False)
@@ -273,7 +338,9 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
                 src = apollo_src.get(raw)
                 if src:
                     val = str(row.get(src, "")).strip()
-                    if val:  # don't overwrite pre-populated value with blank
+                    # Blank-fill only: never overwrite an existing value (first
+                    # file wins) so two uploads of the same UID don't clobber.
+                    if val and not str(master.at[idx, internal]).strip():
                         master.at[idx, internal] = val
             matched += 1
             file_matched += 1
@@ -301,6 +368,9 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
         orphan_path = os.path.join(project_dir, "apollo_orphans_multi.csv")
         pd.DataFrame(orphans).to_csv(orphan_path, index=False)
         log(f"  {unmatched:,} orphan rows → apollo_orphans_multi.csv")
+
+    # Fan person-level enrichment out across each person's other directorships.
+    _fan_out_person_enrichment(master, log)
 
     master.to_csv(enriched_path, index=False)
     log(f"Done: {matched:,} matched ({uid_matched:,} UID, {name_matched:,} name "

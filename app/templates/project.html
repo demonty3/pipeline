@@ -90,6 +90,14 @@
     <button class="btn btn-primary" disabled>Running… <span id="s1-progress-text"></span></button>
   {% endif %}
 
+  <!-- Live terminal — streams the running postcode's full log during a fetch -->
+  <div id="live-terminal" class="live-terminal" style="display:none">
+    <div class="live-terminal-head">
+      <span class="live-dot"></span><span id="live-terminal-title">Fetching…</span>
+    </div>
+    <pre id="live-terminal-body" class="live-terminal-body"></pre>
+  </div>
+
   <!-- Per-area results (shown once areas have been searched) -->
   {% if project.postcodes %}
   <table class="table pc-table" id="pc-table" style="margin-top:1rem">
@@ -850,6 +858,32 @@ function pollStatus() {
           if (rowsEl) rowsEl.textContent = info.rows > 0 ? info.rows.toLocaleString() : '—';
           if (logEl && info.log && info.log.length > 0) {
             logEl.textContent = info.log[info.log.length - 1];
+          }
+        }
+
+        // ── Live terminal: stream the running postcode's full log ──────────
+        const term  = document.getElementById('live-terminal');
+        const tbody = document.getElementById('live-terminal-body');
+        const ttl   = document.getElementById('live-terminal-title');
+        if (term && tbody) {
+          // Prefer the postcode currently running; else the last with output.
+          let active = null;
+          for (const [pc, info] of Object.entries(job.postcodes)) {
+            if (info.status === 'running') { active = [pc, info]; break; }
+            if (info.log && info.log.length) active = [pc, info];
+          }
+          if (active) {
+            const [pc, info] = active;
+            term.style.display = 'block';
+            ttl.textContent = `${pc} — ${info.status}`;
+            // Cap the rendered tail so very long fetches stay snappy.
+            const txt = (info.log || []).slice(-400).join('\n');
+            if (tbody.textContent !== txt) {
+              const atBottom =
+                tbody.scrollHeight - tbody.scrollTop - tbody.clientHeight < 30;
+              tbody.textContent = txt;
+              if (atBottom) tbody.scrollTop = tbody.scrollHeight;
+            }
           }
         }
       }

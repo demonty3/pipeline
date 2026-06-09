@@ -102,9 +102,32 @@ Each stage is one command (`cd app && python3 ../cchq-orchestrator/scripts/run_s
 - After **Stage 6 `vs-export`**, run the file through VoteSource, then drop the
   return back in the folder for `vs-return`.
 
+> **Low on Apollo credits?** Apollo charges one credit per name, so a file can't
+> have more names than you have credits left. Use the **Credit chopper** to trim
+> any file to fit before you upload — it keeps the first *N* names and saves the
+> rest to a `_deferred.csv` for next time (and respects the 10k-per-upload cap).
+> Two ways to run it:
+> - **Web UI:** open the app, click **Credit chopper** (top right), upload the
+>   file, hit *Fetch from Apollo* (or type the number), and download the trimmed
+>   files.
+> - **Tell the assistant / command line:**
+>   `python -m stages.credit_chop <file.csv> [credits]` from the `app/` dir —
+>   omit the number to fetch it live from Apollo.
+
 > **Re-running `merge` is blocked on purpose.** It would reassign every Unique ID
 > and break the deliverable. If you really need to rebuild from scratch, add
 > `--force` (IDs restart at `#<RC>-0001`).
+
+> **The data is a snapshot — re-fetch close to outreach.** Stage 1 captures who's
+> a *sitting* director on the day it runs (it already drops resigned/ceased
+> officers, which is how Companies House records a death). It does **not** update
+> itself afterwards — directors die, resign, get appointed, and companies dissolve
+> over time. A fresh Stage-1 fetch is the only thing that refreshes it (it drops
+> anyone CH has since marked ceased and pulls in new appointments). So if the
+> event/outreach is **weeks or more** after the list was built, **re-run the fetch
+> close to the event** so you're not contacting people who've moved on or died.
+> Caveat: no list can beat Companies House's own filing lag — a very recent death
+> may not be on file yet.
 
 ---
 

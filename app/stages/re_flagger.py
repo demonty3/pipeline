@@ -2,21 +2,28 @@
 Stage 7 — Raiser's Edge fuzzy flagger (mark which people are existing donors).
 
 What it does, in plain English:
-  The operator uploads the Raiser's Edge name export. The RE Name column
-  mixes person and company names in the same field, which is the bit that
-  makes this stage hard. We:
+  The operator uploads the Raiser's Edge export. The RE Name column mixes
+  person and company names in the same field, which is the bit that makes
+  this stage hard. Matching on the name alone produces false positives on
+  common names ("John Smith"), so we now fold in every identifying factor
+  the RE export carries — postcode, town, email — to corroborate a name
+  match before flagging it. We:
     - Normalise both sides (strip titles like "Mr"/"Dr" and suffixes
-      like "Jr"/"II", lowercase, collapse whitespace)
-    - Fuzzy-match every RE entry against every master row using rapidfuzz
-    - Bucket each candidate by score:
-        ≥90       → auto-flag as a match
-        70–89     → Gemini Flash for disambiguation: it first decides
-                    whether the RE entry is a person or a company, then
-                    whether it's the same entity; ≥0.80 confidence
-                    auto-applies, anything else queues for human review
-        <70       → don't flag
+      like "Jr"/"II", lowercase, collapse whitespace; company names also
+      get Charles's Ltd/PLC/UK cleanup so suffixes don't drag the score)
+    - Block by shared name token so we only score plausible pairs, not
+      the full master × RE cross-product
+    - Score the name with rapidfuzz token_sort_ratio, then corroborate
+      with exact email / matching postcode / matching town
+    - Run the deterministic-first cascade:
+        decisive  (email match, or strong name + postcode)  → auto-flag (H)
+        ambiguous (strong name w/o corroboration, or medium  → Gemini Flash;
+                   name) — Gemini sees the factors too           ≥0.80 auto,
+                                                                  else review
+        weak      (low name and no email)                   → don't flag
   Adds RE Match? / Potential / Match? columns to the master and saves
-  master_<REGION>_re_flagged.csv.
+  master_<REGION>_re_flagged.csv. The per-decision reason records which
+  factors fired, for the review screen and audit.
 
 What's different from the old process:
   Replaces Steps 13–14. Used to be: by-eye XLOOKUP of the RE name list
@@ -30,10 +37,19 @@ import pandas as pd
 from rapidfuzz import fuzz
 import google.generativeai as genai
 
-SCORE_HIGH = 90    # auto-flag threshold
-SCORE_MED  = 70    # Gemini disambiguation threshold (below → no flag)
-PASS2_AUTO = 0.80  # Gemini confidence → auto-apply
+from stages.text_cleanup import clean_company_name
+
+# Name-similarity thresholds (rapidfuzz token_sort_ratio, 0–100).
+NAME_STRONG = 90   # near-certain name match
+NAME_MED    = 78   # plausible name match — worth corroborating / asking Gemini
+
+PASS2_AUTO  = 0.80 # Gemini confidence → auto-apply
 PASS2_BATCH = 20
+
+# Blocking: skip RE name tokens this common — they're effectively stopwords
+# ("construction", "services") and would balloon the candidate set.
+TOKEN_DOC_CAP = 60
+MIN_TOKEN_LEN = 3
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -43,9 +59,11 @@ NAME_SUFFIXES  = {"jr", "sr", "ii", "iii", "iv", "esq"}
 SYSTEM_PROMPT = """You are a data-quality assistant for a UK charity donor database (Raiser's Edge).
 Decide whether a Raiser's Edge constituent record refers to the same person or company as a UK Companies House officer record.
 
+Each item gives the officer name, company name, candidate RE name, and — when available — corroborating signals: whether the officer's postcode and town match the RE record's. A matching postcode is strong corroboration; a name match alone (especially a common name) is weak.
+
 Rules:
-- match = strong evidence they refer to the same entity
-- no_match = different person/company or insufficient evidence
+- match = strong evidence (close name AND a corroborating postcode/town, or an exact/near-exact full name)
+- no_match = different entity, or only a loose/common-name overlap with no corroboration
 
 Respond ONLY with a valid JSON array — no prose, no markdown fences.
 Each element: {unique_id, label, match_type, confidence, reason}
@@ -57,35 +75,90 @@ Each element: {unique_id, label, match_type, confidence, reason}
 
 def _normalise(name):
     """Strip titles, suffixes, punctuation, lowercase."""
-    name = name.lower().strip()
+    name = str(name or "").lower().strip()
     name = re.sub(r"[^\w\s]", " ", name)
     tokens = [t for t in name.split() if t not in TITLE_PREFIXES and t not in NAME_SUFFIXES]
     return " ".join(tokens)
 
 
-def _load_re_names(re_path):
+def _norm_company(name):
+    """Company cleaner (Charles's Ltd/PLC/UK logic) + normalise, so entity
+    suffixes don't drag the similarity score down."""
+    return _normalise(clean_company_name(str(name or "")))
+
+
+def _outward(postcode):
+    """UK outward code: 'CM1 2AB' / 'CM12AB' → 'CM1'. '' if blank."""
+    s = re.sub(r"\s+", "", str(postcode or "")).upper()
+    if not s:
+        return ""
+    return s[:-3] if len(s) > 3 else s
+
+
+def _simple(s):
+    """Lowercase, strip, collapse whitespace — for town / generic compares."""
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
+# RE export column headers we look for (case-insensitive), with fallbacks.
+RE_NAME_COLS = ["Name"]
+RE_PC_COLS   = ["Postcode", "Post code", "Postal code"]
+RE_CITY_COLS = ["City", "Town"]
+RE_MAIL_COLS = ["Email address", "Email"]
+
+
+def _find_col(df, candidates):
+    lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
+
+
+def _load_re_records(re_path):
     """
-    Read RE export (XLSX or ODS) and return a list of normalised name strings.
-    Expects a 'Name' column (column 4, index 3).
+    Read the RE export (XLSX/ODS) into a list of records carrying every
+    identifying factor we can match on. Name is required; postcode/city/email
+    are optional — matching degrades gracefully to name-only when absent.
+
+    Each record: {name, norm, tokens, postcode_out, city, email}
     """
     ext = os.path.splitext(re_path)[1].lower()
     try:
         if ext == ".ods":
             df = pd.read_excel(re_path, engine="odf", dtype=str, keep_default_na=False)
+        elif ext == ".csv":
+            df = pd.read_csv(re_path, dtype=str, keep_default_na=False)
         else:
             df = pd.read_excel(re_path, dtype=str, keep_default_na=False)
     except Exception as e:
         raise ValueError(f"Could not read RE export: {e}")
 
-    # Find the Name column — either by header or position
-    if "Name" in df.columns:
-        names = df["Name"].dropna().astype(str).tolist()
-    elif len(df.columns) >= 4:
-        names = df.iloc[:, 3].dropna().astype(str).tolist()
-    else:
+    name_col = _find_col(df, RE_NAME_COLS)
+    if name_col is None and len(df.columns) >= 4:
+        name_col = df.columns[3]   # legacy single-list export: Name is column 4
+    if name_col is None:
         raise ValueError("Could not find a Name column in the RE export.")
 
-    return [n.strip() for n in names if n.strip()]
+    pc_col   = _find_col(df, RE_PC_COLS)
+    city_col = _find_col(df, RE_CITY_COLS)
+    mail_col = _find_col(df, RE_MAIL_COLS)
+
+    records = []
+    for _, row in df.iterrows():
+        raw = str(row[name_col]).strip()
+        if not raw:
+            continue
+        norm = _normalise(raw)
+        records.append({
+            "name": raw,
+            "norm": norm,
+            "tokens": {t for t in norm.split() if len(t) >= MIN_TOKEN_LEN},
+            "postcode_out": _outward(row[pc_col]) if pc_col else "",
+            "city": _simple(row[city_col]) if city_col else "",
+            "email": _simple(row[mail_col]) if mail_col else "",
+        })
+    return records
 
 
 def _pick_master(project_dir, region_code):
@@ -108,60 +181,129 @@ def run_re_flagging(project_id, project_dir, region_code, re_path, gemini_api_ke
         if progress_cb:
             progress_cb(msg)
 
-    re_names = _load_re_names(re_path)
-    log(f"RE export loaded: {len(re_names):,} names")
+    re_records = _load_re_records(re_path)
+    log(f"RE export loaded: {len(re_records):,} records")
+    have_pc   = sum(1 for r in re_records if r["postcode_out"])
+    have_mail = sum(1 for r in re_records if r["email"])
+    log(f"  corroborating factors available — postcode: {have_pc:,}, email: {have_mail:,}"
+        + ("  (name-only export — corroboration limited)" if not (have_pc or have_mail) else ""))
+    # When the RE export carries NO corroborating factors at all, email/postcode
+    # match can never fire — so fall back to auto-flagging on a strong name alone,
+    # else even exact full-name donor matches would be demoted to the review tier.
+    re_name_only = not (have_pc or have_mail)
 
     master_path = _pick_master(project_dir, region_code)
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     log(f"Master loaded: {len(master):,} rows from {os.path.basename(master_path)}")
+    # Defensive: the corroboration columns below are indexed unconditionally with
+    # master.at[idx, ...] — ensure they exist so a master variant missing one
+    # (e.g. an imported file) doesn't KeyError mid-loop.
+    for _c in ("Officer address post code", "Company address post code",
+               "Officer address locality", "Company address locality", "Officer name"):
+        if _c not in master.columns:
+            master[_c] = ""
+    has_apollo_email = "Apollo Email" in master.columns
 
-    # Pre-normalise RE names once
-    re_norm = [_normalise(n) for n in re_names]
+    # ── Inverted token index over RE records, for blocking ────────────────────
+    # Comparing every master row against every RE record is O(N·M) and was the
+    # old bottleneck. Instead we only score RE records that share a name token
+    # with the master row; tokens that are too common are skipped as stopwords.
+    token_index = {}
+    for i, r in enumerate(re_records):
+        for t in r["tokens"]:
+            token_index.setdefault(t, []).append(i)
+    common = {t for t, ids in token_index.items() if len(ids) > TOKEN_DOC_CAP}
+    if common:
+        sample = ", ".join(sorted(common)[:5])
+        log(f"  {len(common)} common token(s) skipped for blocking (e.g. {sample})")
 
     auto_flagged = 0
     gemini_candidates = []  # rows to send to Gemini
     no_flag = 0
 
-    # Pre-normalise master fields
-    person_norm = [
-        _normalise(str(row.get("Surname", "")) + " " + str(row.get("First Name", "")))
-        for _, row in master.iterrows()
-    ]
-    company_norm = [_normalise(str(row.get("Company Name", ""))) for _, row in master.iterrows()]
-
-    for idx, (p_norm, c_norm) in enumerate(zip(person_norm, company_norm)):
+    for idx in range(len(master)):
         uid = master.at[idx, "Unique ID"]
-        best_score = 0
-        best_re_name = ""
-        best_match_type = "person"
+        person_norm  = _normalise(f"{master.at[idx, 'Surname']} {master.at[idx, 'First Name']}")
+        company_norm = _norm_company(master.at[idx, "Company Name"])
 
-        for re_raw, re_n in zip(re_names, re_norm):
-            p_score = fuzz.partial_ratio(p_norm, re_n)
-            c_score = fuzz.partial_ratio(c_norm, re_n)
-            score = max(p_score, c_score)
-            if score > best_score:
-                best_score = score
-                best_re_name = re_raw
-                best_match_type = "person" if p_score >= c_score else "company"
+        # master-side identifying factors (officer or company)
+        m_pc = {_outward(master.at[idx, "Officer address post code"]),
+                _outward(master.at[idx, "Company address post code"])} - {""}
+        m_city = {_simple(master.at[idx, "Officer address locality"]),
+                  _simple(master.at[idx, "Company address locality"])} - {""}
+        m_email = _simple(master.at[idx, "Apollo Email"]) if has_apollo_email else ""
 
-        if best_score >= SCORE_HIGH:
-            db.log_s7_decision(project_id, uid, best_re_name, best_match_type,
-                               "match", confidence=best_score / 100,
-                               reason=f"Auto-match score {best_score}", pass_num=1)
+        # candidate RE records: those sharing a (non-stopword) name token
+        cand_ids = set()
+        row_tokens = {t for t in set(person_norm.split()) | set(company_norm.split())
+                      if len(t) >= MIN_TOKEN_LEN}
+        for t in row_tokens:
+            if t not in common:
+                cand_ids.update(token_index.get(t, ()))
+        # Fallback: if every token was a stopword (a very common surname with no
+        # other distinguishing token), don't silently drop the row — score it
+        # against the common-token candidates too rather than never flagging it.
+        if not cand_ids:
+            for t in row_tokens:
+                cand_ids.update(token_index.get(t, ()))
+
+        best = None
+        for i in cand_ids:
+            r = re_records[i]
+            p_score = fuzz.token_sort_ratio(person_norm, r["norm"])
+            c_score = fuzz.token_sort_ratio(company_norm, r["norm"])
+            if p_score >= c_score:
+                name_score, match_type = p_score, "person"
+            else:
+                name_score, match_type = c_score, "company"
+
+            email_match = bool(m_email and r["email"] and m_email == r["email"])
+            pc_match    = bool(r["postcode_out"] and r["postcode_out"] in m_pc)
+            city_match  = bool(r["city"] and r["city"] in m_city)
+
+            # Corroboration outranks raw name score when picking the best RE hit.
+            rank = name_score + (40 if email_match else 0) + (15 if pc_match else 0) + (6 if city_match else 0)
+            if best is None or rank > best["rank"]:
+                best = {"rank": rank, "name_score": name_score, "match_type": match_type,
+                        "email_match": email_match, "pc_match": pc_match, "city_match": city_match,
+                        "re_name": r["name"], "re_postcode": r["postcode_out"]}
+
+        if best is None:
+            no_flag += 1
+            continue
+
+        ns = best["name_score"]
+        factors = []
+        if best["email_match"]: factors.append("email exact")
+        if best["pc_match"]:    factors.append(f"postcode {best['re_postcode']}")
+        if best["city_match"]:  factors.append("town")
+        factor_str = ", ".join(factors) if factors else "name only"
+
+        # Deterministic-first cascade:
+        #   decisive  → auto-flag (Potential H)
+        #   ambiguous → Gemini Flash (it sees the same factors)
+        #   weak      → no flag
+        if best["email_match"] or (ns >= NAME_STRONG and best["pc_match"]) \
+                or (re_name_only and ns >= NAME_STRONG):
+            db.log_s7_decision(project_id, uid, best["re_name"], best["match_type"],
+                               "match", confidence=min(0.99, ns / 100 + 0.1),
+                               reason=f"Auto-match — name {ns} + {factor_str}", pass_num=1)
             auto_flagged += 1
-        elif best_score >= SCORE_MED:
-            # Log the Pass-1 fuzzy score so the review screen can show it.
-            # label='tentative' keeps it distinct from Pass-1 auto-matches.
-            db.log_s7_decision(project_id, uid, best_re_name, best_match_type,
-                               "tentative", confidence=best_score / 100,
-                               reason=f"Tentative — fuzzy score {best_score}", pass_num=1)
+        elif ns >= NAME_MED:
+            db.log_s7_decision(project_id, uid, best["re_name"], best["match_type"],
+                               "tentative", confidence=ns / 100,
+                               reason=f"Tentative — name {ns} ({factor_str})", pass_num=1)
             gemini_candidates.append({
                 "unique_id": uid,
                 "officer_name": master.at[idx, "Officer name"],
                 "company_name": master.at[idx, "Company Name"],
-                "re_name": best_re_name,
-                "_match_type": best_match_type,
-                "_score": best_score,
+                "re_name": best["re_name"],
+                "officer_postcode": " / ".join(sorted(m_pc)),
+                "re_postcode": best["re_postcode"],
+                "postcode_match": best["pc_match"],
+                "city_match": best["city_match"],
+                "_match_type": best["match_type"],
+                "_score": ns,
             })
         else:
             no_flag += 1
@@ -179,9 +321,12 @@ def run_re_flagging(project_id, project_dir, region_code, re_path, gemini_api_ke
         if not gemini_api_key:
             log("WARNING: GEMINI_API_KEY not set — Gemini candidates sent to human review")
             for c in gemini_candidates:
+                # Leave as 'tentative' (NOT 'match') — without Gemini we cannot
+                # disambiguate, so an un-corroborated common-name collision must
+                # NOT be auto-confirmed as RE Match?=Y; it stays for human review.
                 db.log_s7_decision(project_id, c["unique_id"], c["re_name"], c["_match_type"],
-                                   "match", confidence=0.0,
-                                   reason="Gemini not configured — human review required", pass_num=2)
+                                   "tentative", confidence=0.0,
+                                   reason="Gemini not configured — left for human review", pass_num=2)
             gemini_review = len(gemini_candidates)
         else:
             gemini_auto, gemini_review, _errors, aborted = _run_gemini_pass2(
@@ -223,7 +368,11 @@ def _run_gemini_pass2(project_id, candidates, gemini_api_key, db, log, cancel_ev
 
     for b_idx, batch in enumerate(batches):
         items = [{"unique_id": c["unique_id"], "officer_name": c["officer_name"],
-                  "company_name": c["company_name"], "re_name": c["re_name"]}
+                  "company_name": c["company_name"], "re_name": c["re_name"],
+                  "officer_postcode": c.get("officer_postcode", ""),
+                  "re_postcode": c.get("re_postcode", ""),
+                  "postcode_match": c.get("postcode_match", False),
+                  "town_match": c.get("city_match", False)}
                  for c in batch]
         prompt = SYSTEM_PROMPT + "\n\nItems:\n" + json.dumps(items, ensure_ascii=False)
 

@@ -23,6 +23,7 @@ Stages (run in order; each gates on the previous one's output file):
     magazine [--budget N]     Stage 3 — build Apollo upload batches (<=10k each)
     ingest   --files a.csv... Stage 4 — re-stitch Apollo's enriched exports
     classify                  Stage 5 — Y/T/N classifier (deterministic+Gemini)
+    retry                     Stage 5 — re-run Gemini on rows a 429 left in review
     vs-export                 Stage 6a — build the VoteSource upload (Y/T rows)
     vs-return --file r.csv    Stage 6b — fold a returned VoteSource file back in
     re-flag  --file re.csv    Stage 7 — Raiser's Edge fuzzy flagger
@@ -72,7 +73,9 @@ from stages.ch_fetch import fetch_postcode  # noqa: E402
 from stages.merge import run_merge  # noqa: E402
 from stages.apollo_magazine import build_batches  # noqa: E402
 from stages.apollo_ingest import ingest_multiple  # noqa: E402
-from stages.classifier import run_passes_1_and_2, apply_decisions_and_save  # noqa: E402
+from stages.classifier import (  # noqa: E402
+    run_passes_1_and_2, apply_decisions_and_save, retry_gemini_failed_rows,
+)
 from stages.vs_export import build_vs_export  # noqa: E402
 from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save  # noqa: E402
 from stages.exporter import build_export, _pick_master  # noqa: E402
@@ -215,6 +218,27 @@ def stage_classify(pid, pdir, region, args):
         + (f" -> audit: {os.path.basename(audit)}" if audit else ""))
 
 
+def stage_retry(pid, pdir, region, args):
+    """Re-run Gemini Pass 2 on rows the classifier left in the review queue
+    after a 429/rate-limit (reason 'Gemini error'). Picks up where `classify`
+    stopped without re-running the deterministic pass. Note: rows that were
+    never *tried* (Pass 2 aborted before reaching them) carry only a Pass-1
+    record and aren't in the queue — re-run `classify` to sweep those."""
+    key = require_env("GEMINI_API_KEY")
+    res = retry_gemini_failed_rows(pid, pdir, region, key, db, progress_cb=log)
+    apply_decisions_and_save(pid, pdir, region, db)
+    import pandas as pd
+    cl = pd.read_csv(os.path.join(pdir, f"master_{region}_classified.csv"),
+                     dtype=str, keep_default_na=False)
+    counts = cl["Result"].value_counts().to_dict() if "Result" in cl else {}
+    db.update_stage5_status(pid, "complete")
+    log(f"OK retry — {res.get('retried', 0)} retried, "
+        f"{res.get('auto_applied', 0)} auto-applied, "
+        f"{res.get('still_in_review', 0)} still tentative"
+        + (" (aborted again — Gemini still rate-limited)" if res.get("aborted_gemini") else "")
+        + f". Y/T/N = {counts.get('Y', 0)}/{counts.get('T', 0)}/{counts.get('N', 0)}")
+
+
 def stage_vs_export(pid, pdir, region, args):
     path = build_vs_export(pdir, region, progress_cb=log)
     db.update_stage6_status(pid, "review")  # async: waiting on the return file
@@ -338,7 +362,7 @@ def stage_status(pid, pdir, region, args):
 
 HANDLERS = {
     "fetch": stage_fetch, "merge": stage_merge, "magazine": stage_magazine,
-    "ingest": stage_ingest, "classify": stage_classify,
+    "ingest": stage_ingest, "classify": stage_classify, "retry": stage_retry,
     "vs-export": stage_vs_export, "vs-return": stage_vs_return,
     "re-flag": stage_re_flag, "export": stage_export,
     "summary": stage_summary, "status": stage_status,

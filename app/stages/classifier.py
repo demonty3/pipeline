@@ -24,6 +24,7 @@ import os
 import json
 import csv
 import re
+import time
 import pandas as pd
 from rapidfuzz import fuzz
 import google.generativeai as genai
@@ -193,6 +194,31 @@ def run_passes_1_and_2(project_id, project_dir, region_code, gemini_api_key, pro
 # Three consecutive batch errors → assume Gemini is down and stop hammering it.
 CONSECUTIVE_ERROR_LIMIT = 3
 
+# Pace Gemini calls so a multi-batch region stays under the free-tier RPM cap,
+# and on a 429 honor the server's retry_delay and retry the SAME batch instead
+# of discarding its rows. The caps stop a genuine outage from hanging — once a
+# batch's retries are exhausted it falls through to the consecutive-error abort.
+PASS2_MIN_INTERVAL = 4.0       # seconds to wait between successive Gemini calls
+PASS2_MAX_BATCH_RETRIES = 4    # rate-limit retries per batch before giving up
+PASS2_MAX_BACKOFF = 70         # cap (seconds) on any single retry_delay wait
+
+# Gemini's ResourceExhausted carries a "retry_delay { seconds: N }" hint.
+_RETRY_DELAY_RE = re.compile(r"retry_delay\s*\{\s*seconds:\s*(\d+)", re.I)
+
+
+def _is_rate_limit(exc):
+    """True if the exception looks like a Gemini quota / 429 rate-limit error."""
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    return ("429" in msg or "quota" in msg or "rate limit" in msg or "rate-limit" in msg
+            or "resourceexhausted" in name or "resource_exhausted" in msg)
+
+
+def _retry_delay_seconds(exc, default=30):
+    """Pull the server-suggested retry_delay (seconds) out of a 429, else default."""
+    m = _RETRY_DELAY_RE.search(str(exc))
+    return int(m.group(1)) if m else default
+
 
 def _run_gemini_pass2(project_id, rows, gemini_api_key, log_path, db, log, cancel_event):
     """
@@ -213,14 +239,39 @@ def _run_gemini_pass2(project_id, rows, gemini_api_key, log_path, db, log, cance
 
     for b_idx, batch in enumerate(batches):
         prompt = SYSTEM_PROMPT + "\n\nItems:\n" + json.dumps(batch, ensure_ascii=False)
-        try:
-            resp = model.generate_content(prompt)
-            raw = resp.text.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```[a-z]*\n?", "", raw)
-                raw = re.sub(r"\n?```$", "", raw)
-            decisions = json.loads(raw)
 
+        # Pace requests so a multi-batch region stays under Gemini's RPM cap.
+        # (No wait before the very first call.)
+        if b_idx > 0:
+            time.sleep(PASS2_MIN_INTERVAL)
+
+        # Attempt the batch, retrying on a 429 by honoring the server's
+        # retry_delay rather than throwing the rows to review. Non-rate-limit
+        # errors are not retried — they fall straight through to the handler.
+        decisions = None
+        last_exc = None
+        for attempt in range(PASS2_MAX_BATCH_RETRIES + 1):
+            try:
+                resp = model.generate_content(prompt)
+                raw = resp.text.strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                    raw = re.sub(r"\n?```$", "", raw)
+                decisions = json.loads(raw)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _is_rate_limit(exc) and attempt < PASS2_MAX_BATCH_RETRIES:
+                    wait = min(_retry_delay_seconds(exc), PASS2_MAX_BACKOFF)
+                    log(f"  Batch {b_idx + 1} rate-limited — waiting {wait}s then retrying "
+                        f"({attempt + 1}/{PASS2_MAX_BATCH_RETRIES})")
+                    time.sleep(wait)
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    continue
+                break
+
+        if decisions is not None:
             for d in decisions:
                 uid = d.get("unique_id", "")
                 label = str(d.get("label", "T")).strip().upper()
@@ -245,11 +296,12 @@ def _run_gemini_pass2(project_id, rows, gemini_api_key, log_path, db, log, cance
 
             consecutive_errors = 0
 
-        except Exception as exc:
-            log(f"  Batch {b_idx + 1} Gemini error: {exc} — {len(batch)} rows sent to review")
+        else:
+            # Retries exhausted on a persistent 429, or a non-retryable error.
+            log(f"  Batch {b_idx + 1} Gemini error: {last_exc} — {len(batch)} rows sent to review")
             for r in batch:
                 db.log_s5_decision(project_id, r["unique_id"], 2, "T", confidence=0.0,
-                                   reason=f"Gemini error: {exc}")
+                                   reason=f"Gemini error: {last_exc}")
             pass2_errors += len(batch)
             pass2_review += len(batch)
             consecutive_errors += 1

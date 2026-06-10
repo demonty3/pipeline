@@ -59,7 +59,8 @@ State files (under `cchq-orchestrator/state/`):
    classified, idle" progress — that's what `status.md` is for.
 
 6. **Stop conditions for the tick.** Stage 1 (`fetch`) needs `CH_API_KEY`;
-   Stages 5/7 need `GEMINI_API_KEY`. If a needed key is missing, log it to
+   Stage 5 needs `GEMINI_API_KEY` (Stage 7 needs no key — deterministic only,
+   RE data never goes to an LLM). If a needed key is missing, log it to
    `status.md`, fire the "blocked" notification, and move on — don't crash the loop.
 
 ## Connector note (current Gmail scopes are read-only)

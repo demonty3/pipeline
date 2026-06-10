@@ -1,29 +1,28 @@
 """
-Stage 7 — Raiser's Edge fuzzy flagger (mark which people are existing donors).
+Stage 7 — Raiser's Edge match tiering (mark which people are existing donors).
 
 What it does, in plain English:
   The operator uploads the Raiser's Edge export. The RE Name column mixes
   person and company names in the same field, which is the bit that makes
   this stage hard. Matching on the name alone produces false positives on
-  common names ("John Smith"), so we now fold in every identifying factor
-  the RE export carries — postcode, town, email — to corroborate a name
-  match before flagging it. We:
+  common names ("John Smith"), so we corroborate a name match with every
+  identifying factor the RE export carries — email, postcode, town. We:
     - Normalise both sides (strip titles like "Mr"/"Dr" and suffixes
       like "Jr"/"II", lowercase, collapse whitespace; company names also
       get Charles's Ltd/PLC/UK cleanup so suffixes don't drag the score)
-    - Block by shared name token so we only score plausible pairs, not
-      the full master × RE cross-product
-    - Score the name with rapidfuzz token_sort_ratio, then corroborate
-      with exact email / matching postcode / matching town
-    - Run the deterministic-first cascade:
-        decisive  (email match, or strong name + postcode)  → auto-flag (H)
-        ambiguous (strong name w/o corroboration, or medium  → Gemini Flash;
-                   name) — Gemini sees the factors too           ≥0.80 auto,
-                                                                  else review
-        weak      (low name and no email)                   → don't flag
+    - Block by shared name token (plus an exact-email index, so a donor
+      whose name changed still surfaces) so we only score plausible
+      pairs, not the full master × RE cross-product
+    - Score the name with rapidfuzz token_sort_ratio, then place each
+      row in a certainty tier (Match > Probable > Potential) — formulas
+      only, no LLM. The rules live in _tier() below; the normative spec
+      is cchq-orchestrator/references/schema_contract.md.
   Adds RE Match? / Potential / Match? columns to the master and saves
   master_<REGION>_re_flagged.csv. The per-decision reason records which
-  factors fired, for the review screen and audit.
+  factors fired, for audit.
+
+  RE data is highly sensitive donor data and MUST NOT be sent to any LLM
+  (Charles, 2026-06-10) — every decision here is deterministic.
 
 What's different from the old process:
   Replaces Steps 13–14. Used to be: by-eye XLOOKUP of the RE name list
@@ -31,46 +30,33 @@ What's different from the old process:
   Charles called this out explicitly as the stage most worth improving.
 """
 import os
-import json
 import re
 import pandas as pd
 from rapidfuzz import fuzz
-import google.generativeai as genai
 
 from stages.text_cleanup import clean_company_name
 
 # Name-similarity thresholds (rapidfuzz token_sort_ratio, 0–100).
 NAME_STRONG = 90   # near-certain name match
-NAME_MED    = 78   # plausible name match — worth corroborating / asking Gemini
-
-PASS2_AUTO  = 0.80 # Gemini confidence → auto-apply
-PASS2_BATCH = 20
+NAME_MED    = 78   # plausible name match — the floor for any flag at all
 
 # Blocking: skip RE name tokens this common — they're effectively stopwords
 # ("construction", "services") and would balloon the candidate set.
 TOKEN_DOC_CAP = 60
 MIN_TOKEN_LEN = 3
 
-GEMINI_MODEL = "gemini-2.5-flash"
-
 TITLE_PREFIXES = {"mr", "mrs", "ms", "miss", "dr", "prof", "sir", "lady", "lord", "rev", "the"}
 NAME_SUFFIXES  = {"jr", "sr", "ii", "iii", "iv", "esq"}
 
-SYSTEM_PROMPT = """You are a data-quality assistant for a UK charity donor database (Raiser's Edge).
-Decide whether a Raiser's Edge constituent record refers to the same person or company as a UK Companies House officer record.
+# Tier label → value shown in the master's "Potential" column.
+TIER_DISPLAY = {"match": "Match", "probable": "Probable", "potential": "Potential"}
+# Tier label → certainty order, for picking the best RE candidate per row.
+TIER_ORDER = {"match": 3, "probable": 2, "potential": 1, None: 0}
 
-Each item gives the officer name, company name, candidate RE name, and — when available — corroborating signals: whether the officer's postcode and town match the RE record's. A matching postcode is strong corroboration; a name match alone (especially a common name) is weak.
-
-Rules:
-- match = strong evidence (close name AND a corroborating postcode/town, or an exact/near-exact full name)
-- no_match = different entity, or only a loose/common-name overlap with no corroboration
-
-Respond ONLY with a valid JSON array — no prose, no markdown fences.
-Each element: {unique_id, label, match_type, confidence, reason}
-  label: "match" or "no_match"
-  match_type: "person" or "company"
-  confidence: float 0.0–1.0
-  reason: one short sentence"""
+# Master-side email columns, strongest-evidence first. Apollo Email comes from
+# Stage 4 enrichment; EmailAddress is folded in by a Stage 6b VoteSource return
+# (both keyed on Unique ID, so each is an email for the row's own person).
+EMAIL_COLS = ["Apollo Email", "EmailAddress"]
 
 
 def _normalise(name):
@@ -88,11 +74,21 @@ def _norm_company(name):
 
 
 def _outward(postcode):
-    """UK outward code: 'CM1 2AB' / 'CM12AB' → 'CM1'. '' if blank."""
+    """UK outward code: 'CM1 2AB' / 'CM12AB' → 'CM1'. '' if blank.
+
+    Handles outward-only values too ('LE12', 'SW1A' → unchanged): the inward
+    part is always digit+2letters, so blind last-3 stripping would mangle a
+    4-char outward-only postcode down to a single letter and silently kill
+    postcode corroboration for that record.
+    """
     s = re.sub(r"\s+", "", str(postcode or "")).upper()
     if not s:
         return ""
-    return s[:-3] if len(s) > 3 else s
+    if re.fullmatch(r"[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}", s):  # full postcode
+        return s[:-3]
+    if re.fullmatch(r"[A-Z]{1,2}\d[A-Z\d]?", s):            # outward only
+        return s
+    return s[:-3] if len(s) > 3 else s                       # malformed: legacy rule
 
 
 def _simple(s):
@@ -119,7 +115,8 @@ def _load_re_records(re_path):
     """
     Read the RE export (XLSX/ODS) into a list of records carrying every
     identifying factor we can match on. Name is required; postcode/city/email
-    are optional — matching degrades gracefully to name-only when absent.
+    are optional — matching degrades gracefully to name-only when absent
+    (everything then caps at the Potential tier).
 
     Each record: {name, norm, tokens, postcode_out, city, email}
     """
@@ -169,12 +166,33 @@ def _pick_master(project_dir, region_code):
     raise FileNotFoundError("No suitable master file found for Stage 7.")
 
 
-def run_re_flagging(project_id, project_dir, region_code, re_path, gemini_api_key,
+def _tier(name_score, email_match, pc_match, city_match):
+    """
+    The certainty formula. Returns "match" / "probable" / "potential" / None.
+
+    Charles's rules (2026-06-10): a name-only hit is never more than
+    Potential; an exact email elevates to Match; geographic corroboration
+    earns the middle tier. The email+weak-name case lands on Probable, not
+    Match, because shared company mailboxes (info@…) can collide across
+    different officers of the same firm.
+    """
+    if email_match and name_score >= NAME_MED:
+        return "match"
+    if email_match:
+        return "probable"
+    if name_score >= NAME_STRONG and (pc_match or city_match):
+        return "probable"
+    if name_score >= NAME_MED:
+        return "potential"
+    return None
+
+
+def run_re_flagging(project_id, project_dir, region_code, re_path,
                     progress_cb=None, db=None, cancel_event=None):
     """
-    Run RE fuzzy flagging (Passes 1 + 2).
+    Run RE match tiering — a single deterministic pass, no LLM.
 
-    Returns summary dict: {auto_flagged, gemini_auto, gemini_review, no_flag}
+    Returns summary dict: {match, probable, potential, no_flag}
     """
 
     def log(msg):
@@ -186,11 +204,7 @@ def run_re_flagging(project_id, project_dir, region_code, re_path, gemini_api_ke
     have_pc   = sum(1 for r in re_records if r["postcode_out"])
     have_mail = sum(1 for r in re_records if r["email"])
     log(f"  corroborating factors available — postcode: {have_pc:,}, email: {have_mail:,}"
-        + ("  (name-only export — corroboration limited)" if not (have_pc or have_mail) else ""))
-    # When the RE export carries NO corroborating factors at all, email/postcode
-    # match can never fire — so fall back to auto-flagging on a strong name alone,
-    # else even exact full-name donor matches would be demoted to the review tier.
-    re_name_only = not (have_pc or have_mail)
+        + ("  (name-only export — everything caps at Potential)" if not (have_pc or have_mail) else ""))
 
     master_path = _pick_master(project_dir, region_code)
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
@@ -202,26 +216,37 @@ def run_re_flagging(project_id, project_dir, region_code, re_path, gemini_api_ke
                "Officer address locality", "Company address locality", "Officer name"):
         if _c not in master.columns:
             master[_c] = ""
-    has_apollo_email = "Apollo Email" in master.columns
+    email_cols = [c for c in EMAIL_COLS if c in master.columns]
 
     # ── Inverted token index over RE records, for blocking ────────────────────
     # Comparing every master row against every RE record is O(N·M) and was the
     # old bottleneck. Instead we only score RE records that share a name token
     # with the master row; tokens that are too common are skipped as stopwords.
+    # An exact-email index runs alongside it so a same-email donor whose name
+    # shares no token (married name, nickname) still gets scored.
     token_index = {}
+    email_index = {}
     for i, r in enumerate(re_records):
         for t in r["tokens"]:
             token_index.setdefault(t, []).append(i)
+        if r["email"]:
+            email_index.setdefault(r["email"], []).append(i)
     common = {t for t, ids in token_index.items() if len(ids) > TOKEN_DOC_CAP}
     if common:
         sample = ", ".join(sorted(common)[:5])
         log(f"  {len(common)} common token(s) skipped for blocking (e.g. {sample})")
 
-    auto_flagged = 0
-    gemini_candidates = []  # rows to send to Gemini
+    counts = {"match": 0, "probable": 0, "potential": 0}
     no_flag = 0
+    decisions = []  # (uid, re_name, match_type, label, confidence, reason)
+    cancelled = False
 
     for idx in range(len(master)):
+        if cancel_event and cancel_event.is_set():
+            log(f"  Cancelled at row {idx:,}/{len(master):,} — previous decisions left untouched")
+            cancelled = True
+            break
+
         uid = master.at[idx, "Unique ID"]
         person_norm  = _normalise(f"{master.at[idx, 'Surname']} {master.at[idx, 'First Name']}")
         company_norm = _norm_company(master.at[idx, "Company Name"])
@@ -231,15 +256,18 @@ def run_re_flagging(project_id, project_dir, region_code, re_path, gemini_api_ke
                 _outward(master.at[idx, "Company address post code"])} - {""}
         m_city = {_simple(master.at[idx, "Officer address locality"]),
                   _simple(master.at[idx, "Company address locality"])} - {""}
-        m_email = _simple(master.at[idx, "Apollo Email"]) if has_apollo_email else ""
+        m_emails = {_simple(master.at[idx, c]) for c in email_cols} - {""}
 
-        # candidate RE records: those sharing a (non-stopword) name token
+        # candidate RE records: those sharing a (non-stopword) name token,
+        # plus any exact email hit regardless of name
         cand_ids = set()
         row_tokens = {t for t in set(person_norm.split()) | set(company_norm.split())
                       if len(t) >= MIN_TOKEN_LEN}
         for t in row_tokens:
             if t not in common:
                 cand_ids.update(token_index.get(t, ()))
+        for e in m_emails:
+            cand_ids.update(email_index.get(e, ()))
         # Fallback: if every token was a stopword (a very common surname with no
         # other distinguishing token), don't silently drop the row — score it
         # against the common-token candidates too rather than never flagging it.
@@ -257,231 +285,62 @@ def run_re_flagging(project_id, project_dir, region_code, re_path, gemini_api_ke
             else:
                 name_score, match_type = c_score, "company"
 
-            email_match = bool(m_email and r["email"] and m_email == r["email"])
+            email_match = bool(r["email"] and r["email"] in m_emails)
             pc_match    = bool(r["postcode_out"] and r["postcode_out"] in m_pc)
             city_match  = bool(r["city"] and r["city"] in m_city)
 
-            # Corroboration outranks raw name score when picking the best RE hit.
+            # Pick the best RE hit by TIER first, then corroboration-weighted
+            # rank as the tie-break within a tier. Rank alone is not monotone
+            # with the tier formula — e.g. an unrelated exact-name stranger
+            # (rank 100, Potential) would outrank the actual donor found via
+            # exact email with a changed name (rank ~85, Probable) and the
+            # email evidence would be silently discarded.
+            label = _tier(name_score, email_match, pc_match, city_match)
             rank = name_score + (40 if email_match else 0) + (15 if pc_match else 0) + (6 if city_match else 0)
-            if best is None or rank > best["rank"]:
-                best = {"rank": rank, "name_score": name_score, "match_type": match_type,
-                        "email_match": email_match, "pc_match": pc_match, "city_match": city_match,
+            key = (TIER_ORDER[label], rank)
+            if best is None or key > best["key"]:
+                best = {"key": key, "label": label, "name_score": name_score,
+                        "match_type": match_type, "email_match": email_match,
+                        "pc_match": pc_match, "city_match": city_match,
                         "re_name": r["name"], "re_postcode": r["postcode_out"]}
 
-        if best is None:
+        if best is None or best["label"] is None:
             no_flag += 1
-            continue
-
-        ns = best["name_score"]
-        factors = []
-        if best["email_match"]: factors.append("email exact")
-        if best["pc_match"]:    factors.append(f"postcode {best['re_postcode']}")
-        if best["city_match"]:  factors.append("town")
-        factor_str = ", ".join(factors) if factors else "name only"
-
-        # Deterministic-first cascade:
-        #   decisive  → auto-flag (Potential H)
-        #   ambiguous → Gemini Flash (it sees the same factors)
-        #   weak      → no flag
-        if best["email_match"] or (ns >= NAME_STRONG and best["pc_match"]) \
-                or (re_name_only and ns >= NAME_STRONG):
-            db.log_s7_decision(project_id, uid, best["re_name"], best["match_type"],
-                               "match", confidence=min(0.99, ns / 100 + 0.1),
-                               reason=f"Auto-match — name {ns} + {factor_str}", pass_num=1)
-            auto_flagged += 1
-        elif ns >= NAME_MED:
-            db.log_s7_decision(project_id, uid, best["re_name"], best["match_type"],
-                               "tentative", confidence=ns / 100,
-                               reason=f"Tentative — name {ns} ({factor_str})", pass_num=1)
-            gemini_candidates.append({
-                "unique_id": uid,
-                "officer_name": master.at[idx, "Officer name"],
-                "company_name": master.at[idx, "Company Name"],
-                "re_name": best["re_name"],
-                "officer_postcode": " / ".join(sorted(m_pc)),
-                "re_postcode": best["re_postcode"],
-                "postcode_match": best["pc_match"],
-                "city_match": best["city_match"],
-                "_match_type": best["match_type"],
-                "_score": ns,
-            })
         else:
-            no_flag += 1
+            ns = best["name_score"]
+            factors = []
+            if best["email_match"]: factors.append("email exact")
+            if best["pc_match"]:    factors.append(f"postcode {best['re_postcode']}")
+            if best["city_match"]:  factors.append("town")
+            factor_str = ", ".join(factors) if factors else "name only"
+            decisions.append((uid, best["re_name"], best["match_type"], best["label"],
+                              round(ns / 100, 3), f"name {ns:.0f}, {factor_str}"))
+            counts[best["label"]] += 1
 
         if (idx + 1) % 5000 == 0:
             log(f"  Matched {idx + 1:,}/{len(master):,} rows...")
 
-    log(f"Pass 1 done: {auto_flagged:,} auto-flagged | {len(gemini_candidates):,} for Gemini | {no_flag:,} no match")
+    # Only a COMPLETED run replaces the stored decisions, and it does so in one
+    # atomic transaction — a cancelled or crashed run leaves the previous run's
+    # audit trail (and its master_*_re_flagged.csv) fully consistent.
+    if not cancelled:
+        db.replace_s7_decisions(project_id, decisions)
+        log(f"Tiering done: {counts['match']:,} Match | {counts['probable']:,} Probable | "
+            f"{counts['potential']:,} Potential | {no_flag:,} no flag")
 
-    # ── Pass 2: Gemini Flash ──────────────────────────────────────────────────
-    gemini_auto = gemini_review = 0
-    aborted = False
-
-    if gemini_candidates:
-        if not gemini_api_key:
-            log("WARNING: GEMINI_API_KEY not set — Gemini candidates sent to human review")
-            for c in gemini_candidates:
-                # Leave as 'tentative' (NOT 'match') — without Gemini we cannot
-                # disambiguate, so an un-corroborated common-name collision must
-                # NOT be auto-confirmed as RE Match?=Y; it stays for human review.
-                db.log_s7_decision(project_id, c["unique_id"], c["re_name"], c["_match_type"],
-                                   "tentative", confidence=0.0,
-                                   reason="Gemini not configured — left for human review", pass_num=2)
-            gemini_review = len(gemini_candidates)
-        else:
-            gemini_auto, gemini_review, _errors, aborted = _run_gemini_pass2(
-                project_id, gemini_candidates, gemini_api_key, db, log, cancel_event,
-            )
-
-    log(f"Pass 2 done: {gemini_auto:,} auto-applied | {gemini_review:,} to review"
-        + (" (aborted)" if aborted else ""))
-
-    return {
-        "auto_flagged": auto_flagged,
-        "gemini_auto": gemini_auto,
-        "gemini_review": gemini_review,
-        "no_flag": no_flag,
-        "aborted_gemini": aborted,
-    }
-
-
-# Three consecutive batch errors → assume Gemini is down and stop hammering it.
-CONSECUTIVE_ERROR_LIMIT = 3
-
-
-def _run_gemini_pass2(project_id, candidates, gemini_api_key, db, log, cancel_event):
-    """
-    Run Gemini Pass 2 on a list of candidate dicts (must include unique_id,
-    officer_name, company_name, re_name, _match_type).
-    Returns (auto, review, errors, aborted_gemini).
-    Shared by the initial run and the retry-failed-rows path.
-    """
-    genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-
-    gemini_auto = gemini_review = errors = 0
-    consecutive_errors = 0
-    aborted = False
-
-    batches = [candidates[i:i+PASS2_BATCH] for i in range(0, len(candidates), PASS2_BATCH)]
-    log(f"Pass 2: {len(candidates):,} candidates in {len(batches)} Gemini batch(es)")
-
-    for b_idx, batch in enumerate(batches):
-        items = [{"unique_id": c["unique_id"], "officer_name": c["officer_name"],
-                  "company_name": c["company_name"], "re_name": c["re_name"],
-                  "officer_postcode": c.get("officer_postcode", ""),
-                  "re_postcode": c.get("re_postcode", ""),
-                  "postcode_match": c.get("postcode_match", False),
-                  "town_match": c.get("city_match", False)}
-                 for c in batch]
-        prompt = SYSTEM_PROMPT + "\n\nItems:\n" + json.dumps(items, ensure_ascii=False)
-
-        try:
-            resp = model.generate_content(prompt)
-            raw = resp.text.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```[a-z]*\n?", "", raw)
-                raw = re.sub(r"\n?```$", "", raw)
-            decisions = json.loads(raw)
-
-            for d in decisions:
-                uid = d.get("unique_id", "")
-                label = str(d.get("label", "no_match")).lower()
-                match_type = str(d.get("match_type", "person")).lower()
-                confidence = float(d.get("confidence", 0.0))
-                reason = str(d.get("reason", ""))
-                re_name = next((c["re_name"] for c in batch if c["unique_id"] == uid), "")
-
-                db.log_s7_decision(project_id, uid, re_name, match_type,
-                                   label, confidence=confidence, reason=reason, pass_num=2)
-                if confidence >= PASS2_AUTO:
-                    gemini_auto += 1
-                else:
-                    gemini_review += 1
-
-            consecutive_errors = 0
-
-        except Exception as exc:
-            log(f"  Batch {b_idx + 1} Gemini error: {exc}")
-            for c in batch:
-                db.log_s7_decision(project_id, c["unique_id"], c["re_name"], c["_match_type"],
-                                   "match", confidence=0.0,
-                                   reason=f"Gemini error: {exc}", pass_num=2)
-            gemini_review += len(batch)
-            errors += len(batch)
-            consecutive_errors += 1
-
-            if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
-                remaining = sum(len(b) for b in batches[b_idx + 1:])
-                if remaining:
-                    log(f"  {CONSECUTIVE_ERROR_LIMIT} consecutive Gemini errors — aborting Pass 2. "
-                        f"{remaining:,} rows left untried (use Retry once Gemini is back).")
-                aborted = True
-                break
-
-        if (b_idx + 1) % 5 == 0 or b_idx == len(batches) - 1:
-            log(f"  Pass 2: {b_idx + 1}/{len(batches)} batches done")
-
-        if cancel_event and cancel_event.is_set():
-            log("  Cancelled — stopping after current batch")
-            break
-
-    return gemini_auto, gemini_review, errors, aborted
-
-
-def retry_gemini_failed_rows(project_id, project_dir, region_code, gemini_api_key,
-                              db, progress_cb=None, cancel_event=None):
-    """
-    Re-run Pass 2 on rows currently in the review queue because Gemini errored
-    or was not configured the first time round.
-
-    Returns: {"retried": N, "auto_applied": N, "still_in_review": N, "aborted_gemini": bool}
-    """
-    def log(msg):
-        if progress_cb:
-            progress_cb(msg)
-
-    if not gemini_api_key:
-        log("Cannot retry — GEMINI_API_KEY is still not set.")
-        return {"retried": 0, "auto_applied": 0, "still_in_review": 0, "aborted_gemini": True}
-
-    master_path = _pick_master(project_dir, region_code)
-    master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
-    by_uid = {row["Unique ID"]: row for _, row in master.iterrows()}
-
-    queue = db.get_s7_review_queue(project_id)
-    failed = [q for q in queue if (q.get("reason") or "").startswith(("Gemini error", "Gemini not configured"))]
-    if not failed:
-        log("No Gemini-failed rows in the review queue.")
-        return {"retried": 0, "auto_applied": 0, "still_in_review": 0, "aborted_gemini": False}
-
-    log(f"Retrying Gemini on {len(failed):,} failed row(s)")
-
-    candidates = []
-    for q in failed:
-        uid = q["unique_id"]
-        row = by_uid.get(uid)
-        if row is None:
-            continue
-        candidates.append({
-            "unique_id": uid,
-            "officer_name": str(row.get("Officer name", "")),
-            "company_name": str(row.get("Company Name", "")),
-            "re_name": q.get("re_name", ""),
-            "_match_type": q.get("match_type") or "person",
-        })
-
-    auto, review, _errors, aborted = _run_gemini_pass2(
-        project_id, candidates, gemini_api_key, db, log, cancel_event,
-    )
-
-    return {"retried": len(candidates), "auto_applied": auto,
-            "still_in_review": review, "aborted_gemini": aborted}
+    return {**counts, "no_flag": no_flag, "cancelled": cancelled}
 
 
 def apply_re_decisions_and_save(project_id, project_dir, region_code, db):
     """
     Apply all Stage 7 decisions to the master and save master_{REGION}_re_flagged.csv.
+
+    Column contract (names/order unchanged from golden):
+      RE Match? — Y for every flagged tier, N otherwise; all flagged rows land
+                  on the deliverable's "Potential RE Match" tab
+      Potential — the certainty tier: Match / Probable / Potential
+      Match?    — internal audit trail: which factors fired (overwritten by the
+                  sanity check at export, never shown to the Treasurers)
     """
     master_path = _pick_master(project_dir, region_code)
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
@@ -490,31 +349,21 @@ def apply_re_decisions_and_save(project_id, project_dir, region_code, db):
 
     def get_re_match(uid):
         d = decisions.get(uid)
-        if not d or d["label"] != "match":
-            return "N"
-        return "Y"
+        return "Y" if d and d["label"] in TIER_DISPLAY else "N"
 
     def get_potential(uid):
         d = decisions.get(uid)
-        if not d or d["label"] != "match":
-            return ""
-        if d["pass_num"] == 1:
-            return "H"
-        return "M"
+        return TIER_DISPLAY.get(d["label"], "") if d else ""
 
-    def get_match_confirmed(uid):
+    def get_factors(uid):
         d = decisions.get(uid)
-        if not d or d["label"] != "match":
+        if not d or d["label"] not in TIER_DISPLAY:
             return ""
-        if d["pass_num"] == 1:
-            return "confirmed"
-        if d["pass_num"] == 2 and (d.get("confidence") or 0) >= PASS2_AUTO:
-            return "tentative"
-        return "human"
+        return d.get("reason") or ""
 
     master["RE Match?"] = master["Unique ID"].apply(get_re_match)
     master["Potential"] = master["Unique ID"].apply(get_potential)
-    master["Match?"] = master["Unique ID"].apply(get_match_confirmed)
+    master["Match?"] = master["Unique ID"].apply(get_factors)
 
     out_path = os.path.join(project_dir, f"master_{region_code}_re_flagged.csv")
     master.to_csv(out_path, index=False)

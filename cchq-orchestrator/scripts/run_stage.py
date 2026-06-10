@@ -31,17 +31,21 @@ Stages (run in order; each gates on the previous one's output file):
 
 Environment (put these in app/.env or the real environment):
     CH_API_KEY        Companies House API key  (Stage 1)
-    GEMINI_API_KEY    Gemini Flash key         (Stages 5 & 7 second pass)
+    GEMINI_API_KEY    Gemini Flash key         (Stage 5 second pass only —
+                                                Stage 7 is deterministic, no LLM)
 
 Design notes
 ------------
 - Every command prints stage progress to stdout (the stage modules' own
   ``progress_cb`` log lines) so Claude can read what happened and decide the
   next move. The last line of a successful run is ``OK <stage>``.
-- Stages 5 and 7 use a deterministic -> Gemini -> human cascade. This runner
+- Stage 5 uses a deterministic -> Gemini -> human cascade. This runner
   applies the deterministic + Gemini passes and then auto-applies decisions.
   Any rows the cascade leaves in the human-review band are reported in the
   summary and written to the review queue; rerun ``status`` to see counts.
+- Stage 7 is a single deterministic pass (no Gemini, no review queue) — RE
+  donor data must never reach an LLM. Every hit gets a certainty tier
+  (Match / Probable / Potential); see references/schema_contract.md.
 """
 import argparse
 import json
@@ -254,23 +258,17 @@ def stage_vs_return(pid, pdir, region, args):
 
 
 def stage_re_flag(pid, pdir, region, args):
-    key = require_env("GEMINI_API_KEY")
+    # Deterministic tiering only — RE donor data is highly sensitive and must
+    # never reach an LLM (Charles, 2026-06-10). No API key, no human gate:
+    # every hit lands on the Potential RE Match tab with its certainty tier
+    # (Match / Probable / Potential) so we err toward over-flagging.
     if not args.file:
         log("ERROR: --file is required (the Raiser's Edge export)")
         sys.exit(2)
-    summary = run_re_flagging(pid, pdir, region, args.file, key, progress_cb=log, db=db)
+    summary = run_re_flagging(pid, pdir, region, args.file, progress_cb=log, db=db)
     apply_re_decisions_and_save(pid, pdir, region, db)
-    # No human gate here either: apply_re_decisions_and_save resolves every row
-    # from Gemini's latest call. Low-confidence matches still get flagged Y with
-    # Match?='human' so they surface on the Potential RE Match tab — we err
-    # toward over-flagging a possible existing-donor match. Logged for audit.
-    queue = db.get_s7_review_queue(pid)
-    audit = _write_audit(pdir, f"stage7_autoresolved_{region}.csv", queue,
-                         ["unique_id", "re_name", "label", "confidence", "reason"])
     db.update_stage7_status(pid, "complete")
-    log(f"OK re-flag — {json.dumps(summary)}; "
-        f"{len(queue)} low-confidence flags auto-accepted from Gemini"
-        + (f" -> audit: {os.path.basename(audit)}" if audit else ""))
+    log(f"OK re-flag — {json.dumps(summary)}")
 
 
 def stage_export(pid, pdir, region, args):

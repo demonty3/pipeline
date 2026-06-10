@@ -92,9 +92,11 @@ When Stage 8 produces `<RC>_final_deliverable.xlsx`:
 
 Send a short progress note when:
 - A stage completes a long unattended run (e.g. Stages 1–3 finished).
-- A stage leaves rows in the human-review band — Stage 5 (`classify`) or
-  Stage 7 (`re-flag`) report a non-zero review count. Label the thread
+- A stage leaves rows in the human-review band — only Stage 5 (`classify`)
+  can; it reports a non-zero review count. Label the thread
   `CCHQ/needs-review` and say exactly how many rows and where to review them.
+  (Stage 7 `re-flag` has no review queue — its summary counts are tier
+  totals, not a review band.)
 - Something blocks (missing `CH_API_KEY`/`GEMINI_API_KEY`, Apollo credit cap
   hit and rows deferred to `apollo_deferred_<RC>.csv`).
 

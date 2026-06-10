@@ -84,8 +84,13 @@ the golden v3 format (see the mapping note below).
   <45 → N, middle → Tentative) → Gemini judges the Tentative band in batches →
   only Gemini-low-confidence rows reach human review.
 - Stage 7 writes `RE Match?` (`Y`/blank), `Potential`, and an internal `Match?`
-  (confirmed/tentative/human). Same deterministic → Gemini → human cascade against
-  the Raiser's Edge name list.
+  (the audit factor string, e.g. `name 95, email exact`). **Formulas only — RE
+  donor data is highly sensitive and must never reach an LLM (Charles,
+  2026-06-10).** `Potential` carries the certainty tier:
+  `Match` (exact email + plausible name) > `Probable` (exact email with weak
+  name, or strong name + same postcode/town) > `Potential` (name similarity
+  alone — never elevated without a corroborating factor). All three tiers get
+  `RE Match? = Y` and land on the Potential RE Match tab.
 
 ---
 
@@ -119,7 +124,7 @@ Confirmed against the real `Leicester - Data v3.xlsx` cells (7,244 rows): the
 deliverable's **`Match?`** column holds the *sanity check* as `Yes` / `No` /
 `Tentative` (mapped from the master's `Result`), and the **`Result`** column holds
 `Matched` / `N/A` (whether Apollo returned a contact). The RE-flagger's internal
-confirmed/human level is NOT shown — RE lives in `RE Match?` / `Potential`.
+factor string (master `Match?`) is NOT shown — RE lives in `RE Match?` / `Potential`.
 
 Sort: by CH `Company Name`, case-insensitive, before the rename step (because
 post-rename there are duplicate `Company Name` labels across the CH / echo /

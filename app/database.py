@@ -332,12 +332,22 @@ def get_s5_pass1_scores(project_id):
 
 # ── Stage 7 decisions ─────────────────────────────────────────────────────────
 
-def log_s7_decision(project_id, unique_id, re_name, match_type, label, confidence=None, reason=None, pass_num=1):
+def replace_s7_decisions(project_id, decisions):
+    """
+    Atomically replace all Stage 7 decisions for a project in one transaction:
+    the old set is deleted and the new set inserted together, so a crash can
+    never leave the table half-old/half-new, and a cancelled run (which never
+    calls this) leaves the previous run's audit trail fully intact.
+
+    decisions: iterable of (unique_id, re_name, match_type, label, confidence, reason)
+    """
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO stage7_decisions (project_id, unique_id, re_name, match_type, label, confidence, reason, pass_num, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (project_id, unique_id, re_name, match_type, label, confidence, reason, pass_num, ts),
+        conn.execute("DELETE FROM stage7_decisions WHERE project_id = ?", (project_id,))
+        conn.executemany(
+            "INSERT INTO stage7_decisions (project_id, unique_id, re_name, match_type, label, confidence, reason, pass_num, ts) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            [(project_id, uid, re_name, match_type, label, confidence, reason, ts)
+             for uid, re_name, match_type, label, confidence, reason in decisions],
         )
 
 
@@ -354,48 +364,6 @@ def get_s7_decisions(project_id):
     return by_uid
 
 
-def get_s7_review_queue(project_id):
-    """
-    Latest pass_num=2 record per unique_id, with confidence<0.80 and no
-    pass_num=3 override. Keeps successful retries from being shadowed by an
-    earlier 'Gemini error' record.
-    """
-    with get_db() as conn:
-        rows = conn.execute("""
-            SELECT d2.*
-            FROM stage7_decisions d2
-            WHERE d2.project_id = ?
-              AND d2.pass_num = 2
-              AND d2.id = (
-                SELECT MAX(id) FROM stage7_decisions
-                WHERE project_id = d2.project_id
-                  AND unique_id = d2.unique_id
-                  AND pass_num = 2
-              )
-              AND d2.confidence < 0.80
-              AND NOT EXISTS (
-                SELECT 1 FROM stage7_decisions d3
-                WHERE d3.project_id = d2.project_id
-                  AND d3.unique_id = d2.unique_id
-                  AND d3.pass_num = 3
-              )
-            ORDER BY d2.confidence DESC
-        """, (project_id,)).fetchall()
-        return [dict(r) for r in rows]
-
-
-def get_s7_pass1_scores(project_id):
-    """
-    Map unique_id → Pass-1 fuzzy score (0.0-1.0) for Tentative rows that went
-    into Gemini disambiguation. Lets the review template show the raw similarity.
-    """
-    with get_db() as conn:
-        rows = conn.execute("""
-            SELECT unique_id, confidence
-            FROM stage7_decisions
-            WHERE project_id = ? AND pass_num = 1 AND label = 'tentative'
-        """, (project_id,)).fetchall()
-        return {r["unique_id"]: r["confidence"] for r in rows}
 
 
 def delete_project(project_id):

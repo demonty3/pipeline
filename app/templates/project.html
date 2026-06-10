@@ -590,27 +590,26 @@
   </div>
 
   <p>
-    Upload the RE export (XLSX or ODS) to fuzzy-match constituent names against the master.
-    Adds <code>RE Match?</code>, <code>Potential</code>, and <code>Match?</code> columns.
+    Upload the RE export (XLSX or ODS) to match constituents against the master — formulas only,
+    no LLM (sensitive donor data). Each hit gets a certainty tier in <code>Potential</code>
+    (<strong>Match</strong> &gt; <strong>Probable</strong> &gt; <strong>Potential</strong> —
+    the rules live in <code>schema_contract.md</code>).
     Skip if no RE cross-reference is needed.
-    {% if not has_gemini %}
-    <span style="color:#92400e">⚠ GEMINI_API_KEY not set — medium-confidence matches go straight to human review.</span>
-    {% endif %}
   </p>
 
   {% set s6_done = project.stage6_status in ('complete', 'skipped') %}
   {% if project.stage5_status == 'complete' and s6_done %}
-    {% if project.stage7_status in ('pending', 'error') %}
+    {% if project.stage7_status in ('pending', 'error', 'paused') %}
+      {% if project.stage7_status == 'paused' %}
+      <p style="color:#92400e">Run paused before completion — nothing was saved.
+        Re-upload the RE export to run again from the start.</p>
+      {% endif %}
       <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
         <form method="POST" action="{{ url_for('stage7_upload_re', project_id=project.id) }}"
               enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
           <input type="file" name="file" accept=".xlsx,.ods" required
                  style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
           <button type="submit" class="btn btn-primary">Upload RE export &amp; run</button>
-          <label class="inline-check" title="Untick if you know Gemini is out of credits or unavailable">
-            <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
-            Use Gemini for Pass 2
-          </label>
         </form>
         <form method="POST" action="{{ url_for('stage7_skip', project_id=project.id) }}" style="display:inline">
           <button type="submit" class="btn btn-secondary">Skip RE cross-reference</button>
@@ -618,31 +617,6 @@
       </div>
     {% elif project.stage7_status == 'running' %}
       <button class="btn btn-primary" disabled>Running… <span id="s7-progress"></span></button>
-    {% elif project.stage7_status == 'gemini_unavailable' %}
-      <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;margin-bottom:0.75rem">
-        <strong>Gemini unavailable.</strong>
-        {% if job and job.stage == 7 and job.detail %}
-        {{ job.progress }} — <code style="font-size:0.78rem">{{ job.detail }}</code>
-        {% else %}
-        Pass 2 was aborted because Gemini failed repeatedly. Retry once credits return, or continue manually (every medium-confidence match goes to human review).
-        {% endif %}
-      </div>
-      <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
-        <form method="POST" action="{{ url_for('stage7_continue_manually', project_id=project.id) }}" style="display:inline">
-          <button type="submit" class="btn btn-secondary">Continue without Gemini</button>
-        </form>
-        <form method="POST" action="{{ url_for('stage7_upload_re', project_id=project.id) }}"
-              enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
-          <input type="file" name="file" accept=".xlsx,.ods" required
-                 style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
-          <input type="hidden" name="use_gemini" value="1">
-          <button type="submit" class="btn btn-primary">Retry with Gemini (re-upload RE)</button>
-        </form>
-      </div>
-    {% elif project.stage7_status == 'review_needed' %}
-      <a href="{{ url_for('stage7_review', project_id=project.id) }}" class="btn btn-primary">
-        Review {{ s7_review_count }} match{{ 'es' if s7_review_count != 1 }}
-      </a>
     {% elif project.stage7_status in ('complete', 'skipped') %}
       {% if project.stage7_status == 'complete' %}
         <p style="color:#065f46;font-weight:600">RE flagging complete.</p>

@@ -44,8 +44,9 @@ before touching any column.** It is reconciled against the real golden files
 Stages 3 (Apollo upload) and 6 (VoteSource send) have **human/web-UI steps in
 the middle** — the magazine builds the upload, a person runs it through Apollo's
 or VoteSource's own UI, and the result comes back for `ingest` / `vs-return`
-(often over Gmail — see below). Stages 5 and 7 may leave a residual band for
-human review; the runner reports the count.
+(often over Gmail — see below). Stage 5 may leave a residual band for
+human review; the runner reports the count. Stage 7 never does — it is a
+single deterministic pass with no review queue.
 
 ## How to run a stage
 
@@ -63,9 +64,10 @@ prints the stage's progress and ends with `OK <stage>` on success. Always:
    the previous stage should have added (per `schema_contract.md`).
 3. Run the stage. Read the `OK` line and any review counts before advancing.
 
-**Keys:** Stage 1 needs `CH_API_KEY`, Stages 5 & 7 need `GEMINI_API_KEY`. Put
+**Keys:** Stage 1 needs `CH_API_KEY`, Stage 5 needs `GEMINI_API_KEY`. Put
 them in `app/.env` (never commit — see `app/.env.example`). The runner loads
-`app/.env` automatically.
+`app/.env` automatically. Stage 7 needs no key — RE matching is deterministic
+formulas only; RE donor data must never reach an LLM (Charles, 2026-06-10).
 
 ## Gmail (agentic / background)
 
@@ -84,21 +86,25 @@ compose scopes are granted. See the connector note in both reference files.
 
 ## Autonomous verification (no human gate)
 
-Stages 5 and 7 run fully autonomously: the deterministic pass handles the clear
-cases, Gemini Flash judges the ambiguous band, and **Gemini's call is
-auto-accepted for every row** — no human review queue blocks the pipeline. Every
+Stages 5 and 7 run fully autonomously — no human review queue blocks the
+pipeline. Stage 5: the deterministic pass handles the clear cases, Gemini Flash
+judges the ambiguous band, and **Gemini's call is auto-accepted for every
+row**; low-confidence auto-accepted rows are dumped to
+`stage5_autoresolved_<RC>.csv` for after-the-fact spot-checks. Stage 7 is pure
+formulas: every hit is flagged with a certainty tier in `Potential`
+(`Match` > `Probable` > `Potential` — rules in
+`references/schema_contract.md`), erring toward over-flagging. Every
 decision (label, confidence, reason, the names compared) is logged to
-`classifications_log.csv` and the project DB, and any low-confidence
-auto-accepted rows are dumped to `stage{5,7}_autoresolved_<RC>.csv` so a person
-can spot-check after the fact if they want. This is a deliberate
+`classifications_log.csv` and the project DB. This is a deliberate
 accuracy/throughput trade — the audit trail is what keeps it safe.
 
 ## House rules (from the project's CLAUDE.md)
 
 - Don't make structural decisions silently; push back before coding, not after.
 - Storage is filesystem-first; the SQLite index is metadata only.
-- Gemini is allowed **only** in the Stage 5 and Stage 7 disambiguation tiers —
-  never as a general layer over the pipeline.
+- Gemini is allowed **only** in the Stage 5 disambiguation tier — never as a
+  general layer over the pipeline, and NEVER on Stage 7: Raiser's Edge donor
+  data must not reach any LLM (Charles, 2026-06-10).
 - Keep the existing naming conventions (`results_<PC>.csv`,
   `master_<RC>_*.csv`, `#LE1-0001` Unique IDs) so output stays recognisable.
 - Schema continuity is non-negotiable — the deliverable must stay

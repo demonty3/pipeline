@@ -24,7 +24,7 @@ file-in / file-out, and keeps the master table shape-compatible with the
 
    ```
    CH_API_KEY=your-companies-house-key      # Stage 1 (fetch)
-   GEMINI_API_KEY=your-gemini-flash-key      # Stages 5 & 7 (classify, re-flag)
+   GEMINI_API_KEY=your-gemini-flash-key      # Stage 5 only (classify) — re-flag is LLM-free
    ```
 
 3. **Create the Drive intake folder.** Make a Google Drive folder called

@@ -17,7 +17,6 @@ from stages.classifier import run_passes_1_and_2, apply_decisions_and_save
 PID = 6
 RC = "ESSEX"
 PDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", "6_ESSEX")
-KEY = os.environ.get("GEMINI_API_KEY", "")
 
 
 def log(m):
@@ -25,8 +24,6 @@ def log(m):
 
 
 if __name__ == "__main__":
-    if not KEY:
-        raise SystemExit("GEMINI_API_KEY not set (app/.env)")
-    run_passes_1_and_2(PID, PDIR, RC, KEY, progress_cb=log, db=db)
+    run_passes_1_and_2(PID, PDIR, RC, progress_cb=log, db=db)
     n = apply_decisions_and_save(PID, PDIR, RC, db)
     print(f"OK classify — wrote master_{RC}_classified.csv ({n:,} rows)", flush=True)

@@ -431,55 +431,24 @@
   </div>
 
   <p>
-    Three-pass cascade: deterministic name similarity → Gemini Flash disambiguation → human review.
+    Three-pass cascade: deterministic name similarity → evidence pass (nicknames + email corroboration) → human review.
     Adds a <code>Result</code> column (Y/T/N) to the master.
-    {% if not has_gemini %}
-    <span style="color:#92400e">⚠ GEMINI_API_KEY not set — Tentative rows will go straight to human review.</span>
-    {% endif %}
   </p>
 
   {% if project.stage4_status == 'complete' %}
     {% if project.stage5_status in ('pending', 'error') %}
-      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}"
-            style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">
+      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}">
         <button type="submit" class="btn btn-primary">Run classifier</button>
-        <label class="inline-check" title="Untick if you know Gemini is out of credits or unavailable">
-          <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
-          Use Gemini for Pass 2
-        </label>
       </form>
     {% elif project.stage5_status == 'running' %}
       <button class="btn btn-primary" disabled>Running… <span id="s5-progress"></span></button>
-    {% elif project.stage5_status == 'gemini_unavailable' %}
-      <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;margin-bottom:0.75rem">
-        <strong>Gemini unavailable.</strong>
-        {% if job and job.stage == 5 and job.detail %}
-        {{ job.progress }} — <code style="font-size:0.78rem">{{ job.detail }}</code>
-        {% else %}
-        Pass 2 was aborted because Gemini failed repeatedly. Retry once credits return, or continue manually (every Tentative row goes to human review).
-        {% endif %}
-      </div>
-      <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
-        <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}" style="display:inline">
-          <input type="hidden" name="use_gemini" value="1">
-          <button type="submit" class="btn btn-primary">Retry with Gemini</button>
-        </form>
-        <form method="POST" action="{{ url_for('stage5_continue_manually', project_id=project.id) }}" style="display:inline">
-          <button type="submit" class="btn btn-secondary">Continue without Gemini</button>
-        </form>
-      </div>
     {% elif project.stage5_status == 'review_needed' %}
       <a href="{{ url_for('stage5_review', project_id=project.id) }}" class="btn btn-primary">
         Review {{ s5_review_count }} row{{ 's' if s5_review_count != 1 }}
       </a>
     {% elif project.stage5_status == 'complete' %}
-      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}"
-            style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">
+      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}">
         <button type="submit" class="btn btn-secondary">Re-run classifier</button>
-        <label class="inline-check">
-          <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
-          Use Gemini for Pass 2
-        </label>
       </form>
     {% endif %}
   {% else %}

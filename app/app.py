@@ -22,11 +22,9 @@ from stages.merge import run_merge, backfill_unique_ids, count_missing_unique_id
 from stages.apollo_magazine import build_batches
 from stages.apollo_ingest import ingest_batch, ingest_multiple
 from stages.classifier import (run_passes_1_and_2, apply_decisions_and_save,
-                                retry_gemini_failed_rows as classifier_retry,
                                 count_apollo_placeholders_in_queue,
                                 reclassify_apollo_placeholders)
 from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save
-from stages import gemini_health
 from stages.exporter import build_export
 from stages.vs_export import build_vs_export
 from stages.credit_chop import chop_for_credits
@@ -37,7 +35,6 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-key-change-me")
 
 CH_API_KEY     = os.getenv("CH_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── In-memory job state ───────────────────────────────────────────────────────
 _job_state: dict = {}
@@ -183,7 +180,6 @@ def project_detail(project_id):
         batches_ingested=ingested,
         files=files,
         has_api_key=bool(CH_API_KEY),
-        has_gemini=bool(GEMINI_API_KEY),
         s5_review_count=len(db.get_s5_review_queue(project_id)),
         missing_uids=count_missing_unique_ids(pdir, rc),
     )
@@ -838,57 +834,31 @@ def stage5_run(project_id):
     if job and job.get("stage") == 5 and job.get("status") == "running":
         return jsonify({"error": "Classifier already running"}), 409
 
-    # Form flag: ticked by default in the template. Operator unticks when they
-    # already know Gemini is unavailable and want to go straight to manual.
-    use_gemini = request.form.get("use_gemini") == "1"
-
     pdir = db.project_dir(project_id, project["region_code"])
     rc = project["region_code"]
-
-    # If the operator wants Gemini, ping it first so we fail fast on bad-key /
-    # quota-exhausted / network. The probe is cheap (one trivial generate call).
-    if use_gemini:
-        status, details = gemini_health.ping(GEMINI_API_KEY)
-        if status != "ok":
-            db.update_stage5_status(project_id, "gemini_unavailable")
-            db.add_log(project_id, 5, f"Pre-flight: {gemini_health.human(status)} — {details}")
-            _set_job(project_id, {"stage": 5, "status": "gemini_unavailable",
-                                  "progress": gemini_health.human(status),
-                                  "detail": details})
-            return redirect(url_for("project_detail", project_id=project_id))
 
     _set_job(project_id, {"stage": 5, "status": "running", "progress": "Starting…"})
     db.update_stage5_status(project_id, "running")
     ev = threading.Event()
     _cancel_events[project_id] = ev
-    api_key = GEMINI_API_KEY if use_gemini else ""
-    threading.Thread(target=_run_classifier, args=(project_id, pdir, rc, ev, api_key),
+    threading.Thread(target=_run_classifier, args=(project_id, pdir, rc, ev),
                      daemon=True).start()
     return redirect(url_for("project_detail", project_id=project_id))
 
 
-def _run_classifier(project_id, pdir, rc, cancel_event, gemini_api_key):
+def _run_classifier(project_id, pdir, rc, cancel_event):
     def cb(msg):
         db.add_log(project_id, 5, msg)
         _update_job(project_id, progress=msg)
 
     try:
-        summary = run_passes_1_and_2(project_id, pdir, rc, gemini_api_key,
-                                     progress_cb=cb, db=db, cancel_event=cancel_event)
+        run_passes_1_and_2(project_id, pdir, rc,
+                           progress_cb=cb, db=db, cancel_event=cancel_event)
         _cancel_events.pop(project_id, None)
         if cancel_event.is_set():
             db.update_stage5_status(project_id, "paused")
             db.add_log(project_id, 5, "Classifier paused")
             _update_job(project_id, status="paused")
-            return
-
-        # Gemini died mid-run (3 consecutive batch errors). Don't transition to
-        # review_needed — the operator might want to retry once credits are back.
-        if summary.get("aborted_gemini"):
-            db.update_stage5_status(project_id, "gemini_unavailable")
-            db.add_log(project_id, 5, "Gemini aborted mid-run — choose Retry or Continue manually")
-            _update_job(project_id, status="gemini_unavailable",
-                        progress="Gemini aborted — choose Retry or Continue manually")
             return
 
         review_count = len(db.get_s5_review_queue(project_id))
@@ -907,90 +877,6 @@ def _run_classifier(project_id, pdir, rc, cancel_event, gemini_api_key):
         db.update_stage5_status(project_id, "error")
         db.add_log(project_id, 5, f"ERROR: {exc}")
         _update_job(project_id, status="error", progress=str(exc))
-
-
-@app.route("/project/<int:project_id>/stage5/continue-manually", methods=["POST"])
-def stage5_continue_manually(project_id):
-    """
-    Operator chose 'Continue without Gemini' on the gemini_unavailable screen.
-    Re-runs Pass 1+2 with an empty key, which routes every Tentative row to
-    the manual review queue.
-    """
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-
-    pdir = db.project_dir(project_id, project["region_code"])
-    rc = project["region_code"]
-    _set_job(project_id, {"stage": 5, "status": "running",
-                          "progress": "Manual mode — skipping Gemini…"})
-    db.update_stage5_status(project_id, "running")
-    ev = threading.Event()
-    _cancel_events[project_id] = ev
-    threading.Thread(target=_run_classifier, args=(project_id, pdir, rc, ev, ""),
-                     daemon=True).start()
-    return redirect(url_for("project_detail", project_id=project_id))
-
-
-@app.route("/project/<int:project_id>/stage5/retry-gemini", methods=["POST"])
-def stage5_retry_gemini(project_id):
-    """Re-run Pass 2 only on rows that errored or were never tried."""
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-
-    job = _job(project_id)
-    if job and job.get("stage") == 5 and job.get("status") == "running":
-        return jsonify({"error": "Classifier already running"}), 409
-
-    status, details = gemini_health.ping(GEMINI_API_KEY)
-    if status != "ok":
-        db.update_stage5_status(project_id, "gemini_unavailable")
-        db.add_log(project_id, 5, f"Retry pre-flight failed: {gemini_health.human(status)} — {details}")
-        _set_job(project_id, {"stage": 5, "status": "gemini_unavailable",
-                              "progress": gemini_health.human(status),
-                              "detail": details})
-        return redirect(url_for("project_detail", project_id=project_id))
-
-    pdir = db.project_dir(project_id, project["region_code"])
-    rc = project["region_code"]
-    _set_job(project_id, {"stage": 5, "status": "running", "progress": "Retrying Gemini…"})
-    db.update_stage5_status(project_id, "running")
-    ev = threading.Event()
-    _cancel_events[project_id] = ev
-
-    def worker():
-        def cb(msg):
-            db.add_log(project_id, 5, msg)
-            _update_job(project_id, progress=msg)
-        try:
-            summary = classifier_retry(project_id, pdir, rc, GEMINI_API_KEY,
-                                       db=db, progress_cb=cb, cancel_event=ev)
-            _cancel_events.pop(project_id, None)
-            if summary.get("aborted_gemini"):
-                db.update_stage5_status(project_id, "gemini_unavailable")
-                db.add_log(project_id, 5, "Retry hit consecutive Gemini errors again")
-                _update_job(project_id, status="gemini_unavailable",
-                            progress="Gemini still failing")
-                return
-            review_count = len(db.get_s5_review_queue(project_id))
-            if review_count > 0:
-                db.update_stage5_status(project_id, "review_needed")
-                _update_job(project_id, status="review_needed",
-                            progress=f"{review_count:,} rows still in review")
-            else:
-                rows = apply_decisions_and_save(project_id, pdir, rc, db)
-                db.update_stage5_status(project_id, "complete")
-                db.add_log(project_id, 5, f"Stage 5 complete after retry — {rows:,} rows classified")
-                _update_job(project_id, status="done")
-        except Exception as exc:
-            _cancel_events.pop(project_id, None)
-            db.update_stage5_status(project_id, "error")
-            db.add_log(project_id, 5, f"Retry ERROR: {exc}")
-            _update_job(project_id, status="error", progress=str(exc))
-
-    threading.Thread(target=worker, daemon=True).start()
-    return redirect(url_for("project_detail", project_id=project_id))
 
 
 @app.route("/project/<int:project_id>/stage5/review")
@@ -1016,31 +902,16 @@ def stage5_review(project_id):
                 "apollo_last":  row.get("Apollo Last Name", ""),
             }
 
-    # The Pass-1 Tentative score is the most useful signal when Gemini didn't
-    # give an opinion. Tag each row with where its context came from so the
-    # operator can power through manual-mode queues faster.
+    # The Pass-1 fuzzy score is the operator's best at-a-glance signal for
+    # rows the deterministic passes couldn't settle.
     pass1_scores = db.get_s5_pass1_scores(project_id)
-    failed_count = 0
-    gemini_count = 0
     for item in queue:
         info = name_lookup.get(item["unique_id"], {})
         item["officer_name"] = info.get("officer_name", "")
         item["company_name"] = info.get("company_name", "")
         item["apollo_first"] = info.get("apollo_first", "")
         item["apollo_last"]  = info.get("apollo_last", "")
-
         item["fuzzy_score"] = pass1_scores.get(item["unique_id"])
-
-        reason = item.get("reason") or ""
-        if reason.startswith("Gemini error"):
-            item["source"] = "Gemini error"
-            failed_count += 1
-        elif reason.startswith("Gemini not configured"):
-            item["source"] = "No Gemini"
-            failed_count += 1
-        else:
-            item["source"] = "Gemini low-conf"
-            gemini_count += 1
 
     # Highest-similarity Tentatives first — fastest to confirm by eye.
     queue.sort(key=lambda r: (r.get("fuzzy_score") or 0), reverse=True)
@@ -1050,7 +921,6 @@ def stage5_review(project_id):
     placeholder_count = count_apollo_placeholders_in_queue(project_id, pdir, rc, db)
 
     return render_template("stage5_review.html", project=project, queue=queue,
-                           failed_count=failed_count, gemini_count=gemini_count,
                            placeholder_count=placeholder_count)
 
 

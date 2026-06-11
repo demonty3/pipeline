@@ -2,7 +2,7 @@
 
 The background loop runs this procedure on each wake-up. It polls Gmail (read
 access only) for new pipeline inputs, routes them, advances the pipeline as far
-as the deterministic + Gemini stages allow, and records state locally. Keep each
+as the deterministic stages allow, and records state locally. Keep each
 tick cheap and idempotent — most ticks will find nothing new and exit fast.
 
 State files (under `cchq-orchestrator/state/`):
@@ -40,8 +40,8 @@ State files (under `cchq-orchestrator/state/`):
 
 3. **Run the stage.** Call `scripts/run_stage.py --region <RC> <command> …`.
    Read the `OK <stage>` line. Stages 5 and 7 are fully autonomous (no human
-   gate) — Gemini's call is auto-accepted and logged; report the Y/T/N or
-   flag counts.
+   gate) — Stage 5 is deterministic (fuzzy score + evidence pass); no-evidence
+   rows stay Tentative and are logged; report the Y/T/N or flag counts.
 
 4. **Record.** Add the thread/file id to `processed_threads.json`. Append to
    `status.md`: timestamp, what was processed, the stage result, and any
@@ -54,14 +54,15 @@ State files (under `cchq-orchestrator/state/`):
    for; stay silent on idle ticks. Triggers and example messages:
    - Human checkpoint reached → `"CCHQ LE1: 2 Apollo batches ready to upload (apollo_batch_*.csv)"` / `"CCHQ LE1: VoteSource upload ready — vs_export_LE1.xlsx"`
    - Deliverable built → `"CCHQ LE1 done: 412 Y&T prospects — LE1_final_deliverable.xlsx"`
-   - Blocked → `"CCHQ LE1 blocked: GEMINI_API_KEY not set"` / `"CCHQ: file in inbox didn't match any schema — needs a look"`
+   - Blocked → `"CCHQ LE1 blocked: CH_API_KEY not set"` / `"CCHQ: file in inbox didn't match any schema — needs a look"`
    Keep it one line, lead with the action. No notification for routine "ingested,
    classified, idle" progress — that's what `status.md` is for.
 
 6. **Stop conditions for the tick.** Stage 1 (`fetch`) needs `CH_API_KEY`;
-   Stage 5 needs `GEMINI_API_KEY` (Stage 7 needs no key — deterministic only,
-   RE data never goes to an LLM). If a needed key is missing, log it to
-   `status.md`, fire the "blocked" notification, and move on — don't crash the loop.
+   no other stage needs a key (Stages 5 and 7 are deterministic — no LLM
+   anywhere in the pipeline; RE data never goes to one). If a needed key is
+   missing, log it to `status.md`, fire the "blocked" notification, and move
+   on — don't crash the loop.
 
 ## Connector note (current Gmail scopes are read-only)
 

@@ -287,10 +287,9 @@ def get_s5_review_queue(project_id):
     """
     Rows that need human review: the latest pass_num=2 record per unique_id,
     where that record has confidence<0.70 and no pass_num=3 override exists.
-    Using the latest pass_num=2 means a successful Gemini retry replaces an
-    earlier 'Gemini error' record correctly. The 0.70 threshold matches
-    classifier.PASS2_AUTO — Gemini answers between 0.70 and 0.80 auto-apply
-    rather than escalating to human.
+    The evidence pass logs its T (no-evidence) rows with confidence 0.0, so
+    they land here; its Y upgrades carry confidence >=0.85 and stay out.
+    (Legacy Gemini-era records follow the same threshold.)
     """
     with get_db() as conn:
         rows = conn.execute("""

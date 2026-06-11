@@ -22,8 +22,7 @@ Stages (run in order; each gates on the previous one's output file):
     merge                     Stage 2 — regional merge + Unique IDs + SIC labels
     magazine [--budget N]     Stage 3 — build Apollo upload batches (<=10k each)
     ingest   --files a.csv... Stage 4 — re-stitch Apollo's enriched exports
-    classify                  Stage 5 — Y/T/N classifier (deterministic+Gemini)
-    retry                     Stage 5 — re-run Gemini on rows a 429 left in review
+    classify                  Stage 5 — Y/T/N classifier (fully deterministic)
     vs-export                 Stage 6a — build the VoteSource upload (Y/T rows)
     vs-return --file r.csv    Stage 6b — fold a returned VoteSource file back in
     re-flag  --file re.csv    Stage 7 — Raiser's Edge fuzzy flagger
@@ -32,16 +31,14 @@ Stages (run in order; each gates on the previous one's output file):
 
 Environment (put these in app/.env or the real environment):
     CH_API_KEY        Companies House API key  (Stage 1)
-    GEMINI_API_KEY    Gemini Flash key         (Stage 5 second pass only —
-                                                Stage 7 is deterministic, no LLM)
 
 Design notes
 ------------
 - Every command prints stage progress to stdout (the stage modules' own
   ``progress_cb`` log lines) so Claude can read what happened and decide the
   next move. The last line of a successful run is ``OK <stage>``.
-- Stage 5 uses a deterministic -> Gemini -> human cascade. This runner
-  applies the deterministic + Gemini passes and then auto-applies decisions.
+- Stage 5 is fully deterministic: fuzzy score -> evidence pass (nicknames +
+  email corroboration) -> human review. No LLM anywhere in the pipeline.
   Any rows the cascade leaves in the human-review band are reported in the
   summary and written to the review queue; rerun ``status`` to see counts.
 - Stage 7 is a single deterministic pass (no Gemini, no review queue) — RE
@@ -59,7 +56,7 @@ PROJECT_ROOT = os.path.dirname(SKILL_DIR)
 APP_DIR = os.path.join(PROJECT_ROOT, "app")
 sys.path.insert(0, APP_DIR)
 
-# Load app/.env if present (so CH_API_KEY / GEMINI_API_KEY are available).
+# Load app/.env if present (so CH_API_KEY is available).
 _env_path = os.path.join(APP_DIR, ".env")
 if os.path.exists(_env_path):
     for _line in open(_env_path):
@@ -74,7 +71,7 @@ from stages.merge import run_merge  # noqa: E402
 from stages.apollo_magazine import build_batches  # noqa: E402
 from stages.apollo_ingest import ingest_multiple  # noqa: E402
 from stages.classifier import (  # noqa: E402
-    run_passes_1_and_2, apply_decisions_and_save, retry_gemini_failed_rows,
+    run_passes_1_and_2, apply_decisions_and_save,
 )
 from stages.vs_export import build_vs_export  # noqa: E402
 from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save  # noqa: E402
@@ -182,7 +179,7 @@ def stage_ingest(pid, pdir, region, args):
 
 
 def _write_audit(pdir, name, queue_rows, fields):
-    """Dump the low-confidence rows Gemini auto-resolved to an audit CSV so the
+    """Dump the rows left in the review band to an audit CSV so the
     'no human in the loop' decision stays traceable (scope requires logging
     every decision). Returns the path, or None if there was nothing to write."""
     import csv
@@ -198,12 +195,11 @@ def _write_audit(pdir, name, queue_rows, fields):
 
 
 def stage_classify(pid, pdir, region, args):
-    key = require_env("GEMINI_API_KEY")
-    run_passes_1_and_2(pid, pdir, region, key, progress_cb=log, db=db)
+    run_passes_1_and_2(pid, pdir, region, progress_cb=log, db=db)
     rows = apply_decisions_and_save(pid, pdir, region, db)
-    # No human gate: apply_decisions_and_save already wrote Gemini's label for
-    # every row (low-confidence included; missing -> 'T'). The "review queue" is
-    # just the low-confidence band — we auto-accept Gemini's call and log it.
+    # No human gate: apply_decisions_and_save already wrote a label for every
+    # row (missing -> 'T'). The "review queue" is the no-evidence Tentative
+    # band — we keep those as T and log them for audit.
     queue = db.get_s5_review_queue(pid)
     audit = _write_audit(pdir, f"stage5_autoresolved_{region}.csv", queue,
                          ["unique_id", "label", "confidence", "reason"])
@@ -214,29 +210,8 @@ def stage_classify(pid, pdir, region, args):
     db.update_stage5_status(pid, "complete")
     log(f"OK classify — {rows} rows fully classified (no human gate). "
         f"Y/T/N = {counts.get('Y', 0)}/{counts.get('T', 0)}/{counts.get('N', 0)}; "
-        f"{len(queue)} low-confidence rows auto-accepted from Gemini"
+        f"{len(queue)} no-evidence rows left Tentative"
         + (f" -> audit: {os.path.basename(audit)}" if audit else ""))
-
-
-def stage_retry(pid, pdir, region, args):
-    """Re-run Gemini Pass 2 on rows the classifier left in the review queue
-    after a 429/rate-limit (reason 'Gemini error'). Picks up where `classify`
-    stopped without re-running the deterministic pass. Note: rows that were
-    never *tried* (Pass 2 aborted before reaching them) carry only a Pass-1
-    record and aren't in the queue — re-run `classify` to sweep those."""
-    key = require_env("GEMINI_API_KEY")
-    res = retry_gemini_failed_rows(pid, pdir, region, key, db, progress_cb=log)
-    apply_decisions_and_save(pid, pdir, region, db)
-    import pandas as pd
-    cl = pd.read_csv(os.path.join(pdir, f"master_{region}_classified.csv"),
-                     dtype=str, keep_default_na=False)
-    counts = cl["Result"].value_counts().to_dict() if "Result" in cl else {}
-    db.update_stage5_status(pid, "complete")
-    log(f"OK retry — {res.get('retried', 0)} retried, "
-        f"{res.get('auto_applied', 0)} auto-applied, "
-        f"{res.get('still_in_review', 0)} still tentative"
-        + (" (aborted again — Gemini still rate-limited)" if res.get("aborted_gemini") else "")
-        + f". Y/T/N = {counts.get('Y', 0)}/{counts.get('T', 0)}/{counts.get('N', 0)}")
 
 
 def stage_vs_export(pid, pdir, region, args):
@@ -362,7 +337,7 @@ def stage_status(pid, pdir, region, args):
 
 HANDLERS = {
     "fetch": stage_fetch, "merge": stage_merge, "magazine": stage_magazine,
-    "ingest": stage_ingest, "classify": stage_classify, "retry": stage_retry,
+    "ingest": stage_ingest, "classify": stage_classify,
     "vs-export": stage_vs_export, "vs-return": stage_vs_return,
     "re-flag": stage_re_flag, "export": stage_export,
     "summary": stage_summary, "status": stage_status,

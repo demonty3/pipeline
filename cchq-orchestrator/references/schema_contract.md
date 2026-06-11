@@ -126,9 +126,11 @@ deliverable's **`Match?`** column holds the *sanity check* as `Yes` / `No` /
 `Matched` / `N/A` (whether Apollo returned a contact). The RE-flagger's internal
 factor string (master `Match?`) is NOT shown — RE lives in `RE Match?` / `Potential`.
 
-Sort: by CH `Company Name`, case-insensitive, before the rename step (because
-post-rename there are duplicate `Company Name` labels across the CH / echo /
-Apollo groups).
+Sort: by `Unique ID` ascending, matching golden v3 (its rows run
+`#LE1-0005, 0008, 0009, 0017 …` — UID order, *not* company-name order). Sort on
+the **numeric suffix**, not the raw string — UIDs aren't zero-padded to a fixed
+width (`#ESSEX-9999` then `#ESSEX-10000`), so a lexicographic sort interleaves
+them wrongly.
 
 **If you change anything in this file, regenerate one project end-to-end and
 diff the Stage 8 output against `Leicester - Data v3.xlsx` before shipping.**

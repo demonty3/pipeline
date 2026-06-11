@@ -164,14 +164,21 @@ def build_export(project_dir, region_code, progress_cb=None):
 
     out = pd.DataFrame(cols_out, index=master.index)
 
-    # Sort by Company Name BEFORE the rename step. The v3 layout repeats
-    # "Company Name" / "Surname" / "First Name" across the CH, echo, and
-    # Apollo column groups, so post-rename the DataFrame has duplicate
-    # column labels and sort_values can't pick one. Sorting here uses the
-    # CH "Company Name" while it's still unique.
-    sort_col = "Company Name"
-    if sort_col in out.columns:
-        out = out.sort_values(sort_col, key=lambda s: s.str.lower()).reset_index(drop=True)
+    # Sort by Unique ID ascending — this is the golden v3 row order (its rows
+    # run #LE1-0005, 0008, 0009, 0017 … i.e. UID-ascending, NOT company-name
+    # order). Sort on the numeric suffix, not the string: UIDs aren't padded to
+    # a fixed width (#ESSEX-9999 then #ESSEX-10000), so a lexicographic sort
+    # would interleave them wrongly. Rows with no UID (shouldn't happen post
+    # Stage 2) sort to the end. Done before the rename step for consistency with
+    # the rest of the column handling.
+    if "Unique ID" in out.columns:
+        uid_num = pd.to_numeric(
+            out["Unique ID"].str.extract(r"(\d+)\s*$", expand=False), errors="coerce"
+        )
+        out = (out.assign(_uid_num=uid_num)
+                  .sort_values("_uid_num", kind="stable", na_position="last")
+                  .drop(columns="_uid_num")
+                  .reset_index(drop=True))
 
     # Rename internal names to display names for the final file
     rename_map = {

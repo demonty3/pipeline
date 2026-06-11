@@ -23,6 +23,7 @@ What's different from the old process:
 import os
 import glob
 import re
+import json
 import pandas as pd
 from data.sic_codes import SIC_LABELS
 
@@ -99,6 +100,40 @@ def backfill_unique_ids(project_dir, region_code, starting_counter, progress_cb=
     return n_updated, counter
 
 
+# ── Stable Unique IDs across re-merges ────────────────────────────────────────
+# A Unique ID must follow the PERSON, not the row position. Earlier, run_merge
+# assigned IDs sequentially by row order, so a re-fetch that changed the row
+# count renumbered everyone — which silently mis-joined Apollo enrichment (keyed
+# on old IDs) onto the wrong people. We now persist an identity→UID map per
+# project and reuse it on every merge.
+
+def _identity_key(surname, first, dob, company_number) -> str:
+    """Identity of a (person, company) row — stable across re-fetches because
+    Companies House returns the same Surname / DOB / Company Number for the same
+    appointment. This is the key a Unique ID is pinned to."""
+    return "|".join(str(x).strip().lower()
+                    for x in (surname, first, dob, company_number))
+
+
+def _uid_map_path(project_dir, region_code):
+    return os.path.join(project_dir, f"uid_map_{region_code}.json")
+
+
+def _load_uid_map(project_dir, region_code):
+    """Returns (identity→UID dict, high-water counter)."""
+    p = _uid_map_path(project_dir, region_code)
+    if os.path.exists(p):
+        with open(p) as fh:
+            d = json.load(fh)
+        return dict(d.get("map", {})), int(d.get("counter", 0))
+    return {}, 0
+
+
+def _save_uid_map(project_dir, region_code, uid_map, counter):
+    with open(_uid_map_path(project_dir, region_code), "w") as fh:
+        json.dump({"counter": counter, "map": uid_map}, fh)
+
+
 def count_missing_unique_ids(project_dir, region_code):
     """
     Quick scan: how many rows in master_<RC>_raw.csv have an empty Unique ID?
@@ -173,14 +208,53 @@ def run_merge(project_dir, region_code, id_prefix, starting_counter, progress_cb
     dup_count = master["Apollo Duplicate"].sum()
     log(f"  {dup_count:,} duplicate persons flagged ({len(master) - dup_count:,} unique for Apollo upload)")
 
-    # ── Unique IDs ────────────────────────────────────────────────────────────
-    counter = starting_counter
+    # ── Unique IDs (stable across re-merges) ──────────────────────────────────
+    # Assign by IDENTITY, not row order: a person who already has a UID keeps it,
+    # only genuinely new rows mint a fresh one. This is what stops a re-fetch from
+    # renumbering everyone and mis-joining enrichment onto the wrong people.
+    uid_map, persisted_counter = _load_uid_map(project_dir, region_code)
+    counter = max(starting_counter, persisted_counter)
+
+    # Migration: an existing project has IDs in its current raw master but no map
+    # yet. Seed the map from it so the first post-fix merge PRESERVES today's IDs
+    # rather than re-minting them.
+    raw_path_existing = os.path.join(project_dir, f"master_{region_code}_raw.csv")
+    if not uid_map and os.path.exists(raw_path_existing):
+        prev = pd.read_csv(raw_path_existing, dtype=str, keep_default_na=False)
+        if "Unique ID" in prev.columns:
+            for _, r in prev.iterrows():
+                uid = str(r.get("Unique ID", "")).strip()
+                if not uid:
+                    continue
+                k = _identity_key(r.get("Surname", ""), r.get("First Name", ""),
+                                  r.get("Officer date of birth", ""), r.get("Company Number", ""))
+                uid_map.setdefault(k, uid)
+                m = re.search(r"(\d+)$", uid)
+                if m:
+                    counter = max(counter, int(m.group(1)))
+            log(f"  Seeded UID map from existing master: {len(uid_map):,} known people")
+
+    used = set()
     uid_list = []
-    for _ in range(len(master)):
-        counter += 1
-        uid_list.append(f"#{id_prefix}-{counter:04d}")
+    reused = minted = 0
+    for _, r in master.iterrows():
+        k = _identity_key(r.get("Surname", ""), r.get("First Name", ""),
+                          r.get("Officer date of birth", ""), r.get("Company Number", ""))
+        uid = uid_map.get(k)
+        if uid is not None and uid not in used:
+            reused += 1
+        else:
+            # New person, OR a genuine duplicate row of one already placed this
+            # merge — mint a fresh ID so every row keeps a UNIQUE Unique ID.
+            counter += 1
+            uid = f"#{id_prefix}-{counter:04d}"
+            uid_map.setdefault(k, uid)
+            minted += 1
+        used.add(uid)
+        uid_list.append(uid)
     master["Unique ID"] = uid_list
-    log(f"  Unique IDs assigned: #{id_prefix}-{starting_counter + 1:04d} → #{id_prefix}-{counter:04d}")
+    _save_uid_map(project_dir, region_code, uid_map, counter)
+    log(f"  Unique IDs: {reused:,} reused, {minted:,} newly minted (counter → {counter})")
 
     # ── SIC label ─────────────────────────────────────────────────────────────
     def _map_sic(sic_str):

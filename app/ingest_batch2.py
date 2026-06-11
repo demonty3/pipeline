@@ -32,6 +32,9 @@ from stages.apollo_ingest import (
     APOLLO_INTERNAL_COLS,
     _name_key,
     _build_name_index,
+    _identity_matches,
+    _uid_surname_conflict,
+    UID_CONFLICT_REFUSE_THRESHOLD,
     _fan_out_person_enrichment,
 )
 
@@ -73,22 +76,34 @@ def ingest(file_paths):
                       for c in APOLLO_RAW_COLS
                       if c in apollo.columns or f"{c}.1" in apollo.columns}
 
-        f_uid = f_name = f_orphan = f_filled = 0
+        # Pre-flight: refuse a file produced against a renumbered master.
+        checked, mism = _uid_surname_conflict(master, apollo)
+        if checked and mism / checked > UID_CONFLICT_REFUSE_THRESHOLD:
+            raise SystemExit(
+                f"\nREFUSING {os.path.basename(path)}: {mism:,}/{checked:,} rows "
+                f"carry a Unique ID whose Surname disagrees with the batch-2 master "
+                f"— it was generated against a renumbered master and would mis-join."
+            )
+
+        f_uid = f_name = f_mismatch = f_orphan = f_filled = 0
         for _, row in apollo.iterrows():
             idx = None
             uid = str(row.get("Unique ID", "")).strip()
+            surname = str(row.get("Surname", "")).strip()
+            first = str(row.get("First Name", "")).strip()
+            company = str(row.get("Company Name", "")).strip()
             if uid and uid in uid_to_idx:
-                idx = uid_to_idx[uid]
-                f_uid += 1
-            else:
-                surname = str(row.get("Surname", "")).strip()
-                first = str(row.get("First Name", "")).strip()
-                company = str(row.get("Company Name", "")).strip()
-                if surname and first and company:
-                    key = _name_key(surname, first, company)
-                    if key in name_to_idx:
-                        idx = name_to_idx[key]
-                        f_name += 1
+                cand = uid_to_idx[uid]
+                if _identity_matches(master, cand, surname, first):
+                    idx = cand
+                    f_uid += 1
+                else:
+                    f_mismatch += 1
+            if idx is None and surname and first and company:
+                key = _name_key(surname, first, company)
+                if key in name_to_idx:
+                    idx = name_to_idx[key]
+                    f_name += 1
             if idx is None:
                 orphans.append(row.to_dict())
                 f_orphan += 1
@@ -107,6 +122,7 @@ def ingest(file_paths):
         matched = f_uid + f_name
         print(f"\n  {os.path.basename(path)}: {len(apollo):,} rows")
         print(f"    matched {matched:,}  ({f_uid:,} UID, {f_name:,} name) | "
+              f"UID→wrong-person rejected {f_mismatch:,} | "
               f"orphan {f_orphan:,} | cells filled {f_filled:,}")
         if len(apollo) > 0 and matched == 0:
             bad_files.append((os.path.basename(path), len(apollo)))

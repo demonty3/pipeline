@@ -6,9 +6,11 @@ What it does, in plain English:
   the Companies House officer. Fully deterministic three-tier cascade:
     Pass 1: string similarity (rapidfuzz token-sort ratio)
             ≥85 → Yes, <45 → No, everything in between → Tentative
-    Pass 2: evidence pass on the Tentative band — nickname-normalised
-            re-score (Tom↔Thomas, Andy↔Andrew…) and email corroboration
-            (the Apollo email's local part contains the officer's surname).
+    Pass 2: evidence pass on the Tentative band — core-name agreement
+            (first name + surname match once middle names are ignored),
+            nickname-normalised re-score (Tom↔Thomas, Andy↔Andrew…) and
+            email corroboration (the Apollo email's local part contains
+            the officer's surname).
             Positive evidence upgrades T → Y; no evidence leaves the row T.
     Pass 3: rows still Tentative reach the operator's web UI
   Every decision is written to the stage5_decisions DB table and to
@@ -53,6 +55,8 @@ NICKNAMES = {
     "dave": "david",
     "steve": "stephen", "steven": "stephen",
     "jim": "james", "jimmy": "james", "jamie": "james",
+    "jackie": "jacqueline", "jacqui": "jacqueline",
+    "johnny": "john", "jonny": "john",
     "liz": "elizabeth", "beth": "elizabeth", "lizzie": "elizabeth",
     "kate": "katherine", "cathy": "katherine", "katie": "katherine",
     "catherine": "katherine", "kathryn": "katherine",
@@ -97,13 +101,18 @@ def _normalise(name):
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", name.lower())).strip()
 
 
-def _apollo_name(row):
+def _apollo_name_parts(row):
     first = str(row.get("Apollo First Name", "")).strip()
     last = str(row.get("Apollo Last Name", "")).strip()
     if first.lower() in APOLLO_NULL:
         first = ""
     if last.lower() in APOLLO_NULL:
         last = ""
+    return first, last
+
+
+def _apollo_name(row):
+    first, last = _apollo_name_parts(row)
     return f"{first} {last}".strip()
 
 
@@ -187,6 +196,7 @@ def run_passes_1_and_2(project_id, project_dir, region_code, progress_cb=None, d
                                  "confidence": score / 100,
                                  "reason": f"Tentative — fuzzy score {score}",
                                  "officer_name": officer, "apollo_name": apollo})
+            apollo_first, apollo_last = _apollo_name_parts(row)
             tentative_rows.append({
                 "unique_id": uid,
                 "officer_name": officer,
@@ -195,6 +205,8 @@ def run_passes_1_and_2(project_id, project_dir, region_code, progress_cb=None, d
                 # Evidence-pass inputs:
                 "surname": str(row.get("Surname", "")).strip(),
                 "first_name": str(row.get("First Name", "")).strip(),
+                "apollo_first": apollo_first,
+                "apollo_last": apollo_last,
                 "apollo_email": str(row.get("Apollo Email", "")).strip(),
             })
             pass1_t += 1
@@ -224,6 +236,45 @@ def _canonical_first_names(name):
     return " ".join(NICKNAMES.get(t, t) for t in tokens)
 
 
+def _surnames_agree(surname, apollo_last):
+    """
+    Tri-state surname comparison: None when either side is missing (can't
+    tell), else exact match after normalising, or ≥90 character ratio to
+    tolerate spelling drift (O'Brien/OBrien, hyphens).
+    """
+    sn, al = _normalise(surname or ""), _normalise(apollo_last or "")
+    if not (sn and al):
+        return None
+    return sn == al or fuzz.ratio(sn, al) >= 90
+
+
+def _core_names_agree(surname, first_name, apollo_first, apollo_last):
+    """
+    True when first name + surname agree once middle names are ignored:
+    the officer's surname matches Apollo's last name, and the
+    nickname-canonicalised first names match (exact either way, or ≥90
+    character ratio for spelling drift). Catches the
+    "MASTERS, Stephen Charles Alexander" vs "Steve Masters" band, where
+    middle names drag the full-name fuzzy score under the auto-Y bar —
+    in the TW10 run this pattern was 75 of the 78 rows that reached the
+    human review queue.
+
+    Deliberately structured (surname AND first name must each agree)
+    rather than a fuzzy score over the joined string: "Stephen Bowden"
+    vs "Stephen Brown" must NOT pass, even though a token-sort ratio on
+    the pair clears 85.
+    """
+    if _surnames_agree(surname, apollo_last) is not True:
+        return False
+    fn_toks = _normalise(first_name or "").split()
+    af_toks = _normalise(apollo_first or "").split()
+    if not (fn_toks and af_toks):
+        return False
+    fn = NICKNAMES.get(fn_toks[0], fn_toks[0])
+    af = NICKNAMES.get(af_toks[0], af_toks[0])
+    return fn == af or fuzz.ratio(fn, af) >= 90
+
+
 def _email_corroborates(surname, first_name, email):
     """
     True if the Apollo email's local part contains the officer's surname
@@ -246,7 +297,7 @@ def _email_corroborates(surname, first_name, email):
 def _evidence_pass2(project_id, rows, log_path, db, log):
     """
     Deterministic Pass 2 over the Tentative band. Replaces the old Gemini pass
-    (removed 2026-06-11). Two checks, in order; positive evidence upgrades the
+    (removed 2026-06-11). Three checks, in order; positive evidence upgrades the
     row to Y, otherwise it STAYS T and goes to the human review queue. The pass
     never downgrades to N — absence of evidence is not evidence of mismatch.
 
@@ -261,17 +312,34 @@ def _evidence_pass2(project_id, rows, log_path, db, log):
         uid = r["unique_id"]
         label, confidence, reason = "T", 0.0, "No deterministic evidence — human review"
 
-        # 1. Nickname-normalised re-score: Tom Carson vs THOMAS CARSON.
-        score = fuzz.token_sort_ratio(_canonical_first_names(r["officer_name"]),
-                                      _canonical_first_names(r["apollo_name"]))
-        if score >= PASS1_YES:
-            label, confidence = "Y", score / 100
-            reason = f"Nickname-normalised score {score}"
-        # 2. Email corroboration: david.bennett@… for officer David Bennett.
-        elif _email_corroborates(r.get("surname", ""), r.get("first_name", ""),
-                                 r.get("apollo_email", "")):
-            label, confidence = "Y", 0.9
-            reason = "Email corroborates officer name"
+        # 1. Core-name agreement: Steve Masters vs MASTERS, Stephen Charles
+        #    Alexander — middle names ignored, surname + first name must agree.
+        if _core_names_agree(r.get("surname", ""), r.get("first_name", ""),
+                             r.get("apollo_first", ""), r.get("apollo_last", "")):
+            label, confidence = "Y", 0.95
+            reason = "Core name match — first name + surname agree (middle names ignored)"
+        else:
+            # A surname that positively disagrees (both sides present, no
+            # match) blocks the fuzzy upgrade below: "Stephen Bowden" vs
+            # "Stephen Brown" token-sorts to 89, but they're different people.
+            # Email corroboration is still allowed through — the officer's own
+            # surname in the mailbox outweighs a changed/married display name.
+            surname_contradicted = _surnames_agree(
+                r.get("surname", ""), r.get("apollo_last", "")) is False
+
+            # 2. Nickname-normalised re-score: Tom Carson vs THOMAS CARSON.
+            score = fuzz.token_sort_ratio(_canonical_first_names(r["officer_name"]),
+                                          _canonical_first_names(r["apollo_name"]))
+            if score >= PASS1_YES and not surname_contradicted:
+                label, confidence = "Y", score / 100
+                reason = f"Nickname-normalised score {score}"
+            # 3. Email corroboration: david.bennett@… for officer David Bennett.
+            elif _email_corroborates(r.get("surname", ""), r.get("first_name", ""),
+                                     r.get("apollo_email", "")):
+                label, confidence = "Y", 0.9
+                reason = "Email corroborates officer name"
+            elif surname_contradicted:
+                reason = "Apollo surname disagrees with officer — human review"
 
         db.log_s5_decision(project_id, uid, 2, label, confidence=confidence, reason=reason)
         log_entries.append({

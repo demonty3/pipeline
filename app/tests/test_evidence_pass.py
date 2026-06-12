@@ -9,7 +9,8 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from stages.classifier import _evidence_pass2, _email_corroborates, _canonical_first_names
+from stages.classifier import (_evidence_pass2, _email_corroborates,
+                               _canonical_first_names, _core_names_agree)
 
 
 class FakeDB:
@@ -30,9 +31,11 @@ def _run(rows):
     return y, review, {d["uid"]: d for d in db.decisions}
 
 
-def _row(uid, officer, apollo, surname="", first="", email=""):
+def _row(uid, officer, apollo, surname="", first="", email="",
+         apollo_first="", apollo_last=""):
     return {"unique_id": uid, "officer_name": officer, "apollo_name": apollo,
             "company_name": "X LTD", "surname": surname, "first_name": first,
+            "apollo_first": apollo_first, "apollo_last": apollo_last,
             "apollo_email": email}
 
 
@@ -53,6 +56,44 @@ def test_email_corroboration_upgrades_to_y():
     assert y == 1
     assert dec["#T-2"]["label"] == "Y"
     assert "Email" in dec["#T-2"]["reason"]
+
+
+def test_core_name_ignores_middle_names():
+    """MASTERS, Stephen Charles Alexander vs Steve Masters — middle names
+    dragged the fuzzy score under the bar; core-name agreement upgrades it."""
+    y, review, dec = _run([_row("#T-10", "MASTERS, Stephen Charles Alexander",
+                                "Steve Masters", surname="Masters", first="Stephen",
+                                apollo_first="Steve", apollo_last="Masters")])
+    assert y == 1 and review == 0
+    assert dec["#T-10"]["label"] == "Y"
+    assert "Core name" in dec["#T-10"]["reason"]
+
+
+def test_core_name_nickname_first_names():
+    """BEATON, Jacqueline Mary vs Jackie Beaton — nickname dict bridges Jackie."""
+    assert _core_names_agree("Beaton", "Jacqueline", "Jackie", "Beaton")
+    assert _core_names_agree("Van Haeften", "John", "Johnny", "Van Haeften")
+
+
+def test_core_name_rejects_different_surname():
+    """Stephen Bowden vs Stephen Brown must stay T — a token-sort ratio on the
+    joined names clears 85, but the surnames are different people."""
+    assert not _core_names_agree("Bowden", "Stephen", "Stephen", "Brown")
+    y, review, dec = _run([_row("#T-11", "BOWDEN, Stephen", "Stephen Brown",
+                                surname="Bowden", first="Stephen",
+                                apollo_first="Stephen", apollo_last="Brown")])
+    assert dec["#T-11"]["label"] == "T"
+
+
+def test_core_name_rejects_initial_only_first_name():
+    """Apollo 'J. Masters' — an initial doesn't pin the first name down."""
+    assert not _core_names_agree("Masters", "Stephen", "J.", "Masters")
+
+
+def test_core_name_handles_multi_token_surname():
+    assert _core_names_agree("RUIZ SANTOS", "Diana", "Diana", "Ruiz Santos")
+    # but Apollo carrying only half the surname is NOT enough on its own
+    assert not _core_names_agree("RUIZ SANTOS", "Diana", "Diana", "Santos")
 
 
 def test_no_evidence_stays_t():

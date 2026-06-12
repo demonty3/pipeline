@@ -5,8 +5,10 @@ RE matching is deterministic formulas only — no LLM ever touches RE donor
 data (Charles, 2026-06-10). The normative tier rules live in
 cchq-orchestrator/references/schema_contract.md; the cases below encode them,
 including the regressions: tier outranks raw name score when picking the best
-RE candidate, outward-only RE postcodes still corroborate, and a VoteSource
-`EmailAddress` counts as email evidence alongside `Apollo Email`.
+RE candidate, and a VoteSource `EmailAddress` counts as email evidence
+alongside `Apollo Email`. The 2026-06-12 tightening (Charles): postcode
+corroboration is the FULL postcode, and a person match without email evidence
+requires the officer's surname to appear in the RE name.
 
 Builds a synthetic master + RE export covering each tier and asserts both the
 summary counts and the columns written to the re_flagged master.
@@ -25,7 +27,8 @@ APP_DIR = os.path.dirname(HERE)
 sys.path.insert(0, APP_DIR)
 
 from stages.re_flagger import (  # noqa: E402
-    run_re_flagging, apply_re_decisions_and_save, _tier, _outward,
+    run_re_flagging, apply_re_decisions_and_save, _tier, _full_pc,
+    _surname_agrees,
 )
 
 MASTER_COLS = [
@@ -64,16 +67,18 @@ def _master_row(uid, surname, first, postcode="", locality="", email="", vs_emai
 
 
 def test_unit_tier_formula():
-    # (name_score, email, postcode, town) → expected tier
+    # (name_score, email, postcode, town, surname_ok) → expected tier
     cases = [
-        ((100, True, False, False), "match"),      # email + exact name
-        ((80, True, False, False), "match"),       # email + plausible name
-        ((40, True, False, False), "probable"),    # email but weak name (shared mailbox guard)
-        ((95, False, True, False), "probable"),    # strong name + postcode
-        ((95, False, False, True), "probable"),    # strong name + town
-        ((100, False, False, False), "potential"), # exact name ALONE stays potential
-        ((80, False, True, True), "potential"),    # medium name; geo only elevates strong names
-        ((70, False, False, False), None),         # below the flag floor
+        ((100, True, False, False, True), "match"),      # email + exact name
+        ((80, True, False, False, True), "match"),       # email + plausible name
+        ((40, True, False, False, True), "probable"),    # email but weak name (shared mailbox guard)
+        ((40, True, False, False, False), "probable"),   # email exempt from the surname rule
+        ((95, False, True, False, True), "probable"),    # strong name + postcode
+        ((95, False, False, True, True), "probable"),    # strong name + town
+        ((100, False, False, False, True), "potential"), # exact name ALONE stays potential
+        ((80, False, True, True, True), "potential"),    # medium name; geo only elevates strong names
+        ((95, False, True, True, False), None),          # no email + surname disagrees → no flag
+        ((70, False, False, False, True), None),         # below the flag floor
     ]
     for args, want in cases:
         got = _tier(*args)
@@ -81,20 +86,32 @@ def test_unit_tier_formula():
     print(f"unit: {len(cases)} tier-formula cases OK")
 
 
-def test_unit_outward():
+def test_unit_full_pc():
     cases = [
-        ("CM1 2AB", "CM1"),   # full postcode, space
-        ("CM12AB", "CM1"),    # full postcode, no space
-        ("SW1A 1AA", "SW1A"), # full postcode, 4-char outward
-        ("LE2", "LE2"),       # outward only, 3 chars
-        ("LE12", "LE12"),     # outward only, 4 chars (was mangled to 'L')
-        ("SW1A", "SW1A"),     # outward only, letter-final
+        ("CM1 2AB", "CM12AB"),   # full postcode, space stripped
+        ("cm12ab", "CM12AB"),    # case normalised
+        ("LE12", "LE12"),        # outward-only passes through (never equals a full code)
         ("", ""),
     ]
     for raw, want in cases:
-        got = _outward(raw)
-        assert got == want, f"_outward({raw!r}): want {want!r}, got {got!r}"
-    print(f"unit: {len(cases)} outward-postcode cases OK")
+        got = _full_pc(raw)
+        assert got == want, f"_full_pc({raw!r}): want {want!r}, got {got!r}"
+    print(f"unit: {len(cases)} full-postcode cases OK")
+
+
+def test_unit_surname_agrees():
+    cases = [
+        (("Bowden", "stephen brown"), False),          # same first name ≠ same person
+        (("Kerner", "john kerr"), False),              # kerner/kerr ratio 80 < 90
+        (("Smith", "john smith"), True),               # exact token
+        (("RUIZ SANTOS", "diana ruiz santos"), True),  # multi-token surname
+        (("Lee", "james lee"), True),                  # short surname, exact token
+        (("O'Brien", "mary obrien"), True),            # punctuation drift via ≥90 ratio
+    ]
+    for (surname, re_norm), want in cases:
+        got = _surname_agrees(surname, re_norm.split())
+        assert got == want, f"_surname_agrees({surname!r}, {re_norm!r}): want {want}, got {got}"
+    print(f"unit: {len(cases)} surname-agreement cases OK")
 
 
 def test_end_to_end_tiers():
@@ -103,7 +120,9 @@ def test_end_to_end_tiers():
         _master_row("#TT1-0001", "Pemberton", "Alice", email="alice@pemberton.co.uk"),
         # → Probable: same email, weak name (married-name change found via email index)
         _master_row("#TT1-0002", "Okafor-Hughes", "Chinwe", email="c.hughes@mail.com"),
-        # → Probable: strong name + same outward postcode
+        # → Potential: strong name + same OUTWARD postcode only — since
+        #   2026-06-12 the corroboration is the full postcode, so this no
+        #   longer earns Probable
         _master_row("#TT1-0003", "Szymanski", "Bartholomew", postcode="LE2 4QT"),
         # → Potential: exact name, no corroborating factor
         _master_row("#TT1-0004", "Smith", "John"),
@@ -112,10 +131,16 @@ def test_end_to_end_tiers():
         # → Probable: the email-matched donor must beat a name-only decoy —
         #   tier outranks raw name score in the best-candidate pick
         _master_row("#TT1-0006", "Watson", "Emily", email="e.watson@corp.com"),
-        # → Probable: RE side carries an outward-only 4-char postcode
+        # → Potential: RE side carries an outward-only postcode — can never
+        #   equal a full postcode, so no corroboration
         _master_row("#TT1-0007", "Quattrocchi", "Lorenzo", postcode="LE12 8TT"),
         # → Match: email evidence comes from the VoteSource EmailAddress column
         _master_row("#TT1-0008", "Fitzwilliam", "Harriet", vs_email="h.fitz@mail.com"),
+        # → no flag: shared first name + similar-looking surname token-sorts
+        #   to ~89, but the surname disagrees and there's no email evidence
+        _master_row("#TT1-0009", "Bowden", "Stephen"),
+        # → Probable: strong name + same FULL postcode (household-level)
+        _master_row("#TT1-0010", "Beaumont", "Olivia", postcode="LE2 4QT"),
     ], columns=MASTER_COLS)
 
     re_export = pd.DataFrame([
@@ -130,17 +155,21 @@ def test_end_to_end_tiers():
         {"Name": "Mrs E Hughes", "Postcode": "", "City": "", "Email address": "e.watson@corp.com"},
         {"Name": "Lorenzo Quattrocchi", "Postcode": "LE12", "City": "", "Email address": ""},
         {"Name": "Harriet Fitzwilliam", "Postcode": "", "City": "", "Email address": "h.fitz@mail.com"},
+        {"Name": "Stephen Brown", "Postcode": "", "City": "", "Email address": ""},
+        {"Name": "Olivia Beaumont", "Postcode": "LE2 4QT", "City": "", "Email address": ""},
     ])
 
     want = {
         "#TT1-0001": ("Y", "Match"),
         "#TT1-0002": ("Y", "Probable"),
-        "#TT1-0003": ("Y", "Probable"),
+        "#TT1-0003": ("Y", "Potential"),   # outward-only agreement demoted 2026-06-12
         "#TT1-0004": ("Y", "Potential"),
         "#TT1-0005": ("N", ""),
         "#TT1-0006": ("Y", "Probable"),
-        "#TT1-0007": ("Y", "Probable"),
+        "#TT1-0007": ("Y", "Potential"),   # outward-only agreement demoted 2026-06-12
         "#TT1-0008": ("Y", "Match"),
+        "#TT1-0009": ("N", ""),            # surname disagrees, no email → no flag
+        "#TT1-0010": ("Y", "Probable"),    # full-postcode corroboration
     }
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -163,7 +192,7 @@ def test_end_to_end_tiers():
         # the email-found donor must be the recorded RE hit, not the decoy
         assert db.decisions["#TT1-0006"]["re_name"] == "Mrs E Hughes", db.decisions["#TT1-0006"]
 
-    expected = {"match": 2, "probable": 4, "potential": 1, "no_flag": 1, "cancelled": False}
+    expected = {"match": 2, "probable": 3, "potential": 3, "no_flag": 2, "cancelled": False}
     assert summary == expected, summary
     print(f"end-to-end: summary {summary} OK")
 
@@ -204,7 +233,8 @@ def test_no_llm_imports():
 
 if __name__ == "__main__":
     test_unit_tier_formula()
-    test_unit_outward()
+    test_unit_full_pc()
+    test_unit_surname_agrees()
     test_end_to_end_tiers()
     test_cancelled_run_keeps_old_decisions()
     test_no_llm_imports()

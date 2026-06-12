@@ -81,16 +81,24 @@ the golden v3 format (see the mapping note below).
 
 - Stage 5 writes `Result` ∈ {`Y`, `T`, `N`} — the sanity check (does the Apollo
   contact match the CH officer). Cascade: deterministic fuzzy score (≥85 → Y,
-  <45 → N, middle → Tentative) → Gemini judges the Tentative band in batches →
-  only Gemini-low-confidence rows reach human review.
+  <45 → N, middle → Tentative) → deterministic evidence pass on the Tentative
+  band (core-name agreement ignoring middle names, nickname re-score with a
+  surname-contradiction guard, email corroboration; upgrade-only, T → Y) →
+  only no-evidence rows reach human review. (Gemini removed 2026-06-11.)
 - Stage 7 writes `RE Match?` (`Y`/blank), `Potential`, and an internal `Match?`
   (the audit factor string, e.g. `name 95, email exact`). **Formulas only — RE
   donor data is highly sensitive and must never reach an LLM (Charles,
   2026-06-10).** `Potential` carries the certainty tier:
   `Match` (exact email + plausible name) > `Probable` (exact email with weak
-  name, or strong name + same postcode/town) > `Potential` (name similarity
-  alone — never elevated without a corroborating factor). All three tiers get
-  `RE Match? = Y` and land on the Potential RE Match tab.
+  name, or strong name + same **full** postcode/town) > `Potential` (name
+  similarity alone — never elevated without a corroborating factor).
+  Tightened 2026-06-12 (Charles): postcode corroboration means the full
+  postcode, not the outward/district code (vacuous when the whole project is
+  one district), and a person-name match without email evidence requires the
+  officer's surname to appear in the RE name — otherwise no flag at all.
+  Company-name matches and email-evidenced tiers are exempt from the surname
+  rule. All flagged tiers get `RE Match? = Y` and land on the Potential RE
+  Match tab.
 
 ---
 

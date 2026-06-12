@@ -86,10 +86,10 @@ def _write_sheet(ws, df, header_fills=None, spacer_cols=None):
     """
     Write a DataFrame to a worksheet with the golden v3 ease-of-use features
     (Charles, 2026-06-12: bold Calibri header, frozen header row, auto-filter
-    across all columns, default widths) plus section colouring (Harry,
-    2026-06-12): header cells coloured by the stage that produced their block,
-    and the blank spacer columns narrowed + filled so they read as dividers
-    between sections.
+    across all columns) plus section colouring and text-fitted column widths
+    (Harry, 2026-06-12): header cells coloured by the stage that produced
+    their block, columns sized to their content, and the blank spacer columns
+    narrowed + filled so they read as dividers between sections.
 
     header_fills: hex string per column (None = plain bold header cell).
     spacer_cols: 0-based indices of the blank spacer columns.
@@ -112,7 +112,15 @@ def _write_sheet(ws, df, header_fills=None, spacer_cols=None):
         else:
             cell.font = Font(bold=True)
 
-    # Spacer columns become narrow grey dividers, filled top to bottom.
+    # Fit each column to its longest value (capped so one long URL doesn't
+    # blow a column out to a full screen width).
+    for col in ws.columns:
+        max_len = max((len(str(cell.value)) for cell in col if cell.value is not None),
+                      default=8)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+
+    # Spacer columns become narrow grey dividers, filled top to bottom
+    # (after auto-fit, so they stay narrow).
     for ci in (spacer_cols or []):
         ws.column_dimensions[get_column_letter(ci + 1)].width = 2.5
         for r in range(1, ws.max_row + 1):

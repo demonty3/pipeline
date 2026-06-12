@@ -1179,4 +1179,13 @@ def stage8_export(project_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5050)
+    # Stage jobs run as daemon threads inside this process, so any stage still
+    # marked 'running' from a previous server is dead — surface it as an error
+    # instead of showing frozen progress.
+    for pid, stage in db.fail_stale_running_stages():
+        db.add_log(pid, stage,
+                   "ERROR: server restarted mid-run — job lost, please re-run this stage")
+    # use_reloader=False: the auto-reloader restarts the process on every file
+    # save, which silently kills running stage threads. Restart manually after
+    # code changes instead.
+    app.run(debug=True, use_reloader=False, port=5050)

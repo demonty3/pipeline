@@ -157,6 +157,27 @@ def update_stage7_status(project_id, status): _set_status(project_id, "stage7_st
 def update_stage8_status(project_id, status): _set_status(project_id, "stage8_status", status)
 
 
+def fail_stale_running_stages():
+    """Mark any stage left at 'running' as 'error'. Call once at server startup.
+
+    Stage jobs run as daemon threads inside the server process, so if the
+    server died or restarted mid-run the thread is gone and 'running' is a
+    lie — the UI would show frozen progress forever.
+    Returns a list of (project_id, stage_number) that were reset.
+    """
+    stale = []
+    with get_db() as conn:
+        for stage in range(1, 9):
+            col = f"stage{stage}_status"
+            rows = conn.execute(
+                f"SELECT id FROM projects WHERE {col} = 'running'").fetchall()
+            for row in rows:
+                conn.execute(f"UPDATE projects SET {col} = 'error' WHERE id = ?",
+                             (row["id"],))
+                stale.append((row["id"], stage))
+    return stale
+
+
 def update_search_areas(project_id, areas):
     """Persist the search areas (postcode districts / towns) entered at Stage 1."""
     with get_db() as conn:

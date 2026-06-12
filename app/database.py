@@ -69,6 +69,9 @@ def init_db():
                 ts TEXT NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_s5_decisions_uid
+                ON stage5_decisions (project_id, unique_id, pass_num);
+
             CREATE TABLE IF NOT EXISTS stage7_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,

@@ -138,6 +138,56 @@ h2 { font-size: 1.1rem; margin: 0; }
 .pc-table td { font-size: 0.82rem; }
 .log-msg { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #555; }
 
+/* Stats strip — one headline number per stage, on the project page */
+.stats-strip {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 1px;
+  background: #e2e2e2;          /* shows through the gaps as hairline dividers */
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  margin-bottom: 1.25rem;
+}
+.stat {
+  display: block;
+  background: #fff;
+  padding: 0.55rem 0.7rem 0.5rem;
+  text-decoration: none;
+  color: inherit;
+  min-width: 0;
+}
+.stat:hover { background: #fafafa; }
+.stat-label {
+  display: block;
+  font-size: 0.64rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  white-space: nowrap;
+}
+.stat-value {
+  display: block;
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: #1a1a2e;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.stat-sub {
+  display: block;
+  font-size: 0.68rem;
+  color: #777;
+  line-height: 1.35;
+  min-height: 0.95rem;          /* keeps cells level when a sub-line is empty */
+  font-variant-numeric: tabular-nums;
+}
+.stat-empty .stat-value { color: #c4c4c4; font-weight: 500; }
+@media (max-width: 880px) {
+  .stats-strip { grid-template-columns: repeat(4, 1fr); }
+}
+
 /* Stage cards */
 .stage-card {
   background: #fff;

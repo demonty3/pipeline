@@ -26,6 +26,7 @@ from stages.classifier import (run_passes_1_and_2, apply_decisions_and_save,
                                 reclassify_apollo_placeholders)
 from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save
 from stages.exporter import build_export
+from stats import project_stats
 from stages.vs_export import build_vs_export
 from stages.credit_chop import chop_for_credits
 
@@ -182,6 +183,7 @@ def project_detail(project_id):
         has_api_key=bool(CH_API_KEY),
         s5_review_count=len(db.get_s5_review_queue(project_id)),
         missing_uids=count_missing_unique_ids(pdir, rc),
+        stats=project_stats(project, pdir, batches),
     )
 
 

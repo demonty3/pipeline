@@ -27,6 +27,60 @@
   </div>
 </div>
 
+{# ── Stats strip — one headline number per stage, click to jump ──────────── #}
+{% if stats.s1 or stats.s2 %}
+<div class="stats-strip">
+  <a class="stat {{ '' if stats.s1 else 'stat-empty' }}" href="#stage1-card"
+     title="Officer rows fetched from Companies House">
+    <span class="stat-label">1 · Fetched</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s1.rows) if stats.s1 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s1 %}{{ stats.s1.areas_done }}/{{ stats.s1.areas_total }} areas{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s2 else 'stat-empty' }}" href="#stage2-card"
+     title="Rows in the merged master (duplicate persons are kept but flagged)">
+    <span class="stat-label">2 · Master</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s2.rows) if stats.s2 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s2 %}{{ "{:,}".format(stats.s2.dups) }} dups flagged{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s3 else 'stat-empty' }}" href="#stage3-card"
+     title="Unique rows queued for Apollo enrichment">
+    <span class="stat-label">3 · To Apollo</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s3.rows) if stats.s3 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s3 %}{{ stats.s3.sent }}/{{ stats.s3.batches }} batches sent{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s4 else 'stat-empty' }}" href="#stage4-card"
+     title="Rows where Apollo returned a contact / a usable email address">
+    <span class="stat-label">4 · Enriched</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s4.matched) if stats.s4 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s4 %}{{ "{:,}".format(stats.s4.emails) }} emails{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s5 else 'stat-empty' }}" href="#stage5-card"
+     title="Sanity check — Apollo contact matches the officer (Y confirmed, T tentative, N no)">
+    <span class="stat-label">5 · Sanity Y+T</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s5.y + stats.s5.t) if stats.s5 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s5 %}Y&nbsp;{{ "{:,}".format(stats.s5.y) }} · T&nbsp;{{ "{:,}".format(stats.s5.t) }} · N&nbsp;{{ "{:,}".format(stats.s5.n) }}{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s6 else 'stat-empty' }}" href="#stage6-card"
+     title="Rows that came back with VoteSource data">
+    <span class="stat-label">6 · VoteSource</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s6.overlaid) if stats.s6 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s6 %}rows overlaid{% elif project.stage6_status == 'skipped' %}skipped{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s7 else 'stat-empty' }}" href="#stage7-card"
+     title="{% if stats.s7 %}Match {{ stats.s7.match }} · Probable {{ stats.s7.probable }} · Potential {{ stats.s7.potential }}{% else %}Possible existing Raiser's Edge donors{% endif %}">
+    <span class="stat-label">7 · RE flagged</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s7.flagged) if stats.s7 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s7 %}M&nbsp;{{ "{:,}".format(stats.s7.match) }} · Pr&nbsp;{{ "{:,}".format(stats.s7.probable) }} · Po&nbsp;{{ "{:,}".format(stats.s7.potential) }}{% elif project.stage7_status == 'skipped' %}skipped{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if (stats.s8 and files.final) else 'stat-empty' }}" href="#stage8-card"
+     title="Final deliverable — Y&T outreach list (RE-flagged rows live on the RE tab instead)">
+    <span class="stat-label">8 · Final Y&amp;T</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s8.yt) if stats.s8 and files.final else "—" }}</span>
+    <span class="stat-sub">{% if stats.s8 and files.final %}ALL&nbsp;{{ "{:,}".format(stats.s8.all) }} · RE&nbsp;{{ "{:,}".format(stats.s8.re) }}{% endif %}</span>
+  </a>
+</div>
+{% endif %}
+
 {% if not has_api_key %}
 <div class="alert alert-error">
   <strong>CH_API_KEY not set.</strong> Add it to <code>app/.env</code> before fetching. You can still import an existing master below.

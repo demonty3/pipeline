@@ -26,7 +26,8 @@ import os
 import pandas as pd
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 # Master file precedence (most enriched to least)
 MASTER_SUFFIXES = ["re_flagged", "vs", "classified", "enriched", "raw"]
@@ -81,18 +82,42 @@ def _pick_master(project_dir, region_code):
     raise FileNotFoundError("No master file found. Run at least Stage 2 first.")
 
 
-def _write_sheet(ws, df):
+def _write_sheet(ws, df, header_fills=None, spacer_cols=None):
     """
-    Write a DataFrame to a worksheet styled like the golden v3 workbook
-    (Charles, 2026-06-12 — same look and ease of use as the golden file):
-    plain Calibri with a bold header row, the header row frozen, and an
-    auto-filter across all columns. No fills, no custom fonts, no custom
-    column widths — Excel defaults, exactly as the golden file has them.
+    Write a DataFrame to a worksheet with the golden v3 ease-of-use features
+    (Charles, 2026-06-12: bold Calibri header, frozen header row, auto-filter
+    across all columns, default widths) plus section colouring (Harry,
+    2026-06-12): header cells coloured by the stage that produced their block,
+    and the blank spacer columns narrowed + filled so they read as dividers
+    between sections.
+
+    header_fills: hex string per column (None = plain bold header cell).
+    spacer_cols: 0-based indices of the blank spacer columns.
     """
     for row in dataframe_to_rows(df, index=False, header=True):
         ws.append(row)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
+
+    fill_cache = {}
+
+    def _fill(hex_code):
+        if hex_code not in fill_cache:
+            fill_cache[hex_code] = PatternFill(start_color=hex_code,
+                                               end_color=hex_code, fill_type="solid")
+        return fill_cache[hex_code]
+
+    for i, cell in enumerate(ws[1]):
+        if header_fills and i < len(header_fills) and header_fills[i]:
+            cell.fill = _fill(header_fills[i])
+            cell.font = Font(bold=True, color="FFFFFF")
+        else:
+            cell.font = Font(bold=True)
+
+    # Spacer columns become narrow grey dividers, filled top to bottom.
+    for ci in (spacer_cols or []):
+        ws.column_dimensions[get_column_letter(ci + 1)].width = 2.5
+        for r in range(1, ws.max_row + 1):
+            ws.cell(row=r, column=ci + 1).fill = _fill("D9D9D9")
+
     ws.freeze_panes = "A2"
     if len(df):
         ws.auto_filter.ref = ws.dimensions
@@ -206,25 +231,43 @@ def build_export(project_dir, region_code, progress_cb=None):
     re_mask = out["_re_flag"] == "Y"
     out = out.drop(columns=["_re_flag"])
 
+    # ── Section colouring: one header fill per column block (Harry 2026-06-12)
+    # Mirrors the column construction above — keep in step with cols_out.
+    NAVY, BURGUNDY, GREEN, GREY, BLUE = "1A1A2E", "6E2234", "2F6D4F", "595959", "2C5F8A"
+    header_fills = (
+        [NAVY] * (1 + len(FINAL_CH_COLS))      # Unique ID + CH block (stages 1-2)
+        + [None, None]                          # spacers
+        + [BURGUNDY, BURGUNDY]                  # RE Match? (tier), Potential (donor) — stage 7
+        + [None]                                # spacer
+        + [GREEN]                               # Match? — sanity check (stage 5)
+        + [GREY] * (len(FINAL_ECHO_COLS) + 1)   # echoes + Result (Apollo bookkeeping)
+        + [GREY] * len(FINAL_APOLLO_DISPLAY)    # Apollo data (stage 4)
+    )
+    if vs_present:
+        header_fills += [None] + [BLUE] * len(VS_RETURN_COLS)  # VoteSource (stage 6)
+    assert len(header_fills) == len(out.columns), \
+        f"header_fills ({len(header_fills)}) out of step with columns ({len(out.columns)})"
+    spacer_cols = [i for i, c in enumerate(out.columns) if c == ""]
+
     # ── Build XLSX ────────────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
 
     # Sheet 1: ALL
     ws_all = wb.active
     ws_all.title = "ALL"
-    _write_sheet(ws_all, out)
+    _write_sheet(ws_all, out, header_fills, spacer_cols)
     log(f"  Sheet 'ALL': {len(out):,} rows")
 
     # Sheet 2: Y&T — golden filters on the sanity check (Match? = Yes/Tentative)
     df_yt = out[out["Match?"].isin(["Yes", "Tentative"])]
     ws_yt = wb.create_sheet("Y&T")
-    _write_sheet(ws_yt, df_yt)
+    _write_sheet(ws_yt, df_yt, header_fills, spacer_cols)
     log(f"  Sheet 'Y&T': {len(df_yt):,} rows")
 
     # Sheet 3: Potential RE Match
     df_re = out[re_mask]
     ws_re = wb.create_sheet("Potential RE Match")
-    _write_sheet(ws_re, df_re)
+    _write_sheet(ws_re, df_re, header_fills, spacer_cols)
     log(f"  Sheet 'Potential RE Match': {len(df_re):,} rows")
 
     out_path = os.path.join(project_dir, f"{region_code}_final_deliverable.xlsx")

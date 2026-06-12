@@ -23,7 +23,7 @@ to confirm which `master_<REGION>_*.csv` exists before advancing.
 | 4 ingest    | `master_<RC>_enriched.csv`         | + 22 `Apollo <col>` columns |
 | 5 classify  | `master_<RC>_classified.csv`       | + `Result` (Y / T / N) |
 | 6 vs-return | `master_<RC>_vs.csv`               | + whatever columns the VoteSource return carried |
-| 7 re-flag   | `master_<RC>_re_flagged.csv`       | + `RE Match?`, `Potential`, `Match?` |
+| 7 re-flag   | `master_<RC>_re_flagged.csv`       | + `RE Match?`, `Potential`, `RE Name`, `Match?` |
 | 8 export    | `<RC>_final_deliverable.xlsx`      | multi-tab, reshaped to v3 layout (see below) |
 
 Stage 8 reads the **most enriched** master that exists
@@ -90,15 +90,12 @@ the golden v3 format (see the mapping note below).
   donor data is highly sensitive and must never reach an LLM (Charles,
   2026-06-10).** `Potential` carries the certainty tier:
   `Match` (exact email + plausible name) > `Probable` (exact email with weak
-  name, or strong name + same **full** postcode/town) > `Potential` (name
-  similarity alone — never elevated without a corroborating factor).
-  Tightened 2026-06-12 (Charles): postcode corroboration means the full
-  postcode, not the outward/district code (vacuous when the whole project is
-  one district), and a person-name match without email evidence requires the
-  officer's surname to appear in the RE name — otherwise no flag at all.
-  Company-name matches and email-evidenced tiers are exempt from the surname
-  rule. All flagged tiers get `RE Match? = Y` and land on the Potential RE
-  Match tab.
+  name, or strong name + same postcode/town) > `Potential` (name similarity
+  alone — never elevated without a corroborating factor). All three tiers get
+  `RE Match? = Y` and land on the Potential RE Match tab.
+  (The 2026-06-12 full-postcode/surname tightening was reverted the same day —
+  Harry: keep the matching aligned with how the golden deliverable was
+  produced.)
 
 ---
 
@@ -123,6 +120,11 @@ Unique ID,
                                                        26-col master)
 <blank>, <blank>,
 RE Match?, Potential, <blank>, Match?,
+                                   (golden semantics, confirmed 2026-06-12:
+                                    RE Match? = the certainty slot — golden
+                                    showed 'Potential'; now the tier word
+                                    Match/Probable/Potential. Potential = the
+                                    matched RE donor's NAME, as golden.)
 Surname (echo), First Name (echo), Company Name (echo), Result,
 <22 Apollo cols, prefix stripped: First Name … Company Founded Year>
 ```

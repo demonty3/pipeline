@@ -17,10 +17,6 @@ What it does, in plain English:
       row in a certainty tier (Match > Probable > Potential) — formulas
       only, no LLM. The rules live in _tier() below; the normative spec
       is cchq-orchestrator/references/schema_contract.md.
-      Tightened 2026-06-12 (Charles): postcode corroboration is the FULL
-      postcode (outward-only matching is vacuous in a single-district
-      project), and a person match without email evidence requires the
-      officer's surname to actually appear in the RE name.
   Adds RE Match? / Potential / Match? columns to the master and saves
   master_<REGION>_re_flagged.csv. The per-decision reason records which
   factors fired, for audit.
@@ -77,16 +73,22 @@ def _norm_company(name):
     return _normalise(clean_company_name(str(name or "")))
 
 
-def _full_pc(postcode):
-    """Normalised full postcode for exact comparison: 'cm1 2ab' → 'CM12AB'.
+def _outward(postcode):
+    """UK outward code: 'CM1 2AB' / 'CM12AB' → 'CM1'. '' if blank.
 
-    Corroboration is full-postcode (household-level) by design: outward-code
-    matching can't separate anyone when the whole project is a single
-    district — every TW10 officer "corroborated" against every TW10 donor
-    (Charles, 2026-06-12). An outward-only value on either side therefore
-    never corroborates; it just fails the equality check.
+    Handles outward-only values too ('LE12', 'SW1A' → unchanged): the inward
+    part is always digit+2letters, so blind last-3 stripping would mangle a
+    4-char outward-only postcode down to a single letter and silently kill
+    postcode corroboration for that record.
     """
-    return re.sub(r"\s+", "", str(postcode or "")).upper()
+    s = re.sub(r"\s+", "", str(postcode or "")).upper()
+    if not s:
+        return ""
+    if re.fullmatch(r"[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}", s):  # full postcode
+        return s[:-3]
+    if re.fullmatch(r"[A-Z]{1,2}\d[A-Z\d]?", s):            # outward only
+        return s
+    return s[:-3] if len(s) > 3 else s                       # malformed: legacy rule
 
 
 def _simple(s):
@@ -116,7 +118,7 @@ def _load_re_records(re_path):
     are optional — matching degrades gracefully to name-only when absent
     (everything then caps at the Potential tier).
 
-    Each record: {name, norm, tokens, postcode, city, email}
+    Each record: {name, norm, tokens, postcode_out, city, email}
     """
     ext = os.path.splitext(re_path)[1].lower()
     try:
@@ -149,7 +151,7 @@ def _load_re_records(re_path):
             "name": raw,
             "norm": norm,
             "tokens": {t for t in norm.split() if len(t) >= MIN_TOKEN_LEN},
-            "postcode": _full_pc(row[pc_col]) if pc_col else "",
+            "postcode_out": _outward(row[pc_col]) if pc_col else "",
             "city": _simple(row[city_col]) if city_col else "",
             "email": _simple(row[mail_col]) if mail_col else "",
         })
@@ -164,44 +166,20 @@ def _pick_master(project_dir, region_code):
     raise FileNotFoundError("No suitable master file found for Stage 7.")
 
 
-def _surname_agrees(surname, re_norm_tokens):
-    """
-    Does the officer's surname actually appear in the RE name? Token-level:
-    any surname token equal to an RE-name token (any length), or ≥90
-    character ratio between 4+-char tokens for spelling drift. Handles
-    multi-token surnames ("RUIZ SANTOS" agrees with "Diana Ruiz Santos").
-
-    Required for person-type flags without email evidence (Charles,
-    2026-06-12): officer "Stephen Bowden" must not flag against donor
-    "Stephen Brown", however the whole-name fuzzy score lands.
-    """
-    for st in _normalise(surname).split():
-        for rt in re_norm_tokens:
-            if st == rt or (len(st) >= 4 and len(rt) >= 4
-                            and fuzz.ratio(st, rt) >= 90):
-                return True
-    return False
-
-
-def _tier(name_score, email_match, pc_match, city_match, surname_ok=True):
+def _tier(name_score, email_match, pc_match, city_match):
     """
     The certainty formula. Returns "match" / "probable" / "potential" / None.
 
-    Charles's rules (2026-06-10, tightened 2026-06-12): a name-only hit is
-    never more than Potential; an exact email elevates to Match; geographic
-    corroboration (full postcode or town) earns the middle tier. The
-    email+weak-name case lands on Probable, not Match, because shared
-    company mailboxes (info@…) can collide across different officers of the
-    same firm. Without email evidence, a person match whose surname doesn't
-    agree gets no flag at all — email tiers are exempt because the email
-    index exists precisely for changed/married display names.
+    Charles's rules (2026-06-10): a name-only hit is never more than
+    Potential; an exact email elevates to Match; geographic corroboration
+    earns the middle tier. The email+weak-name case lands on Probable, not
+    Match, because shared company mailboxes (info@…) can collide across
+    different officers of the same firm.
     """
     if email_match and name_score >= NAME_MED:
         return "match"
     if email_match:
         return "probable"
-    if not surname_ok:
-        return None
     if name_score >= NAME_STRONG and (pc_match or city_match):
         return "probable"
     if name_score >= NAME_MED:
@@ -223,7 +201,7 @@ def run_re_flagging(project_id, project_dir, region_code, re_path,
 
     re_records = _load_re_records(re_path)
     log(f"RE export loaded: {len(re_records):,} records")
-    have_pc   = sum(1 for r in re_records if r["postcode"])
+    have_pc   = sum(1 for r in re_records if r["postcode_out"])
     have_mail = sum(1 for r in re_records if r["email"])
     log(f"  corroborating factors available — postcode: {have_pc:,}, email: {have_mail:,}"
         + ("  (name-only export — everything caps at Potential)" if not (have_pc or have_mail) else ""))
@@ -270,13 +248,12 @@ def run_re_flagging(project_id, project_dir, region_code, re_path,
             break
 
         uid = master.at[idx, "Unique ID"]
-        surname      = master.at[idx, "Surname"]
-        person_norm  = _normalise(f"{surname} {master.at[idx, 'First Name']}")
+        person_norm  = _normalise(f"{master.at[idx, 'Surname']} {master.at[idx, 'First Name']}")
         company_norm = _norm_company(master.at[idx, "Company Name"])
 
         # master-side identifying factors (officer or company)
-        m_pc = {_full_pc(master.at[idx, "Officer address post code"]),
-                _full_pc(master.at[idx, "Company address post code"])} - {""}
+        m_pc = {_outward(master.at[idx, "Officer address post code"]),
+                _outward(master.at[idx, "Company address post code"])} - {""}
         m_city = {_simple(master.at[idx, "Officer address locality"]),
                   _simple(master.at[idx, "Company address locality"])} - {""}
         m_emails = {_simple(master.at[idx, c]) for c in email_cols} - {""}
@@ -309,12 +286,8 @@ def run_re_flagging(project_id, project_dir, region_code, re_path,
                 name_score, match_type = c_score, "company"
 
             email_match = bool(r["email"] and r["email"] in m_emails)
-            pc_match    = bool(r["postcode"] and r["postcode"] in m_pc)
+            pc_match    = bool(r["postcode_out"] and r["postcode_out"] in m_pc)
             city_match  = bool(r["city"] and r["city"] in m_city)
-            # Company-name matches are exempt from the surname rule — there
-            # is no officer surname to find in an RE company-style entry.
-            surname_ok  = (match_type == "company"
-                           or _surname_agrees(surname, r["norm"].split()))
 
             # Pick the best RE hit by TIER first, then corroboration-weighted
             # rank as the tie-break within a tier. Rank alone is not monotone
@@ -322,14 +295,14 @@ def run_re_flagging(project_id, project_dir, region_code, re_path,
             # (rank 100, Potential) would outrank the actual donor found via
             # exact email with a changed name (rank ~85, Probable) and the
             # email evidence would be silently discarded.
-            label = _tier(name_score, email_match, pc_match, city_match, surname_ok)
+            label = _tier(name_score, email_match, pc_match, city_match)
             rank = name_score + (40 if email_match else 0) + (15 if pc_match else 0) + (6 if city_match else 0)
             key = (TIER_ORDER[label], rank)
             if best is None or key > best["key"]:
                 best = {"key": key, "label": label, "name_score": name_score,
                         "match_type": match_type, "email_match": email_match,
                         "pc_match": pc_match, "city_match": city_match,
-                        "re_name": r["name"], "re_postcode": r["postcode"]}
+                        "re_name": r["name"], "re_postcode": r["postcode_out"]}
 
         if best is None or best["label"] is None:
             no_flag += 1
@@ -337,9 +310,7 @@ def run_re_flagging(project_id, project_dir, region_code, re_path,
             ns = best["name_score"]
             factors = []
             if best["email_match"]: factors.append("email exact")
-            if best["pc_match"]:
-                pc = best["re_postcode"]
-                factors.append(f"postcode {pc[:-3]} {pc[-3:]}" if len(pc) > 4 else f"postcode {pc}")
+            if best["pc_match"]:    factors.append(f"postcode {best['re_postcode']}")
             if best["city_match"]:  factors.append("town")
             factor_str = ", ".join(factors) if factors else "name only"
             decisions.append((uid, best["re_name"], best["match_type"], best["label"],
@@ -364,10 +335,12 @@ def apply_re_decisions_and_save(project_id, project_dir, region_code, db):
     """
     Apply all Stage 7 decisions to the master and save master_{REGION}_re_flagged.csv.
 
-    Column contract (names/order unchanged from golden):
+    Column contract (master-internal; the exporter does the golden mapping):
       RE Match? — Y for every flagged tier, N otherwise; all flagged rows land
                   on the deliverable's "Potential RE Match" tab
       Potential — the certainty tier: Match / Probable / Potential
+      RE Name   — the matched RE donor's name (golden's "Potential" column
+                  showed this; the exporter maps it back there)
       Match?    — internal audit trail: which factors fired (overwritten by the
                   sanity check at export, never shown to the Treasurers)
     """
@@ -390,8 +363,15 @@ def apply_re_decisions_and_save(project_id, project_dir, region_code, db):
             return ""
         return d.get("reason") or ""
 
+    def get_re_name(uid):
+        d = decisions.get(uid)
+        if not d or d["label"] not in TIER_DISPLAY:
+            return ""
+        return d.get("re_name") or ""
+
     master["RE Match?"] = master["Unique ID"].apply(get_re_match)
     master["Potential"] = master["Unique ID"].apply(get_potential)
+    master["RE Name"] = master["Unique ID"].apply(get_re_name)
     master["Match?"] = master["Unique ID"].apply(get_factors)
 
     out_path = os.path.join(project_dir, f"master_{region_code}_re_flagged.csv")

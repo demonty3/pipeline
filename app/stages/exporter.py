@@ -9,6 +9,9 @@ What it does, in plain English:
     - ALL                 every row, all columns
     - Y&T                 rows where Result is Y or T
     - Potential RE Match  rows where RE Match? is Y
+  Every tab carries the same golden-v3 column layout (Charles,
+  2026-06-12: the columns must match the golden standard; the per-tab
+  value is the row segmentation, not a different column set).
   Apollo columns lose the internal "Apollo " prefix on the way out so
   the file looks identical to the Treasurers' current format.
 
@@ -23,7 +26,7 @@ import os
 import pandas as pd
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font
 
 # Master file precedence (most enriched to least)
 MASTER_SUFFIXES = ["re_flagged", "vs", "classified", "enriched", "raw"]
@@ -78,23 +81,21 @@ def _pick_master(project_dir, region_code):
     raise FileNotFoundError("No master file found. Run at least Stage 2 first.")
 
 
-def _write_sheet(ws, df, header_fill_hex="1A1A2E"):
-    """Write a DataFrame to an openpyxl worksheet with a styled header row."""
-    header_fill = PatternFill(start_color=header_fill_hex, end_color=header_fill_hex, fill_type="solid")
-    header_font = Font(color="FFFFFF", bold=True, size=9)
-
-    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), start=1):
+def _write_sheet(ws, df):
+    """
+    Write a DataFrame to a worksheet styled like the golden v3 workbook
+    (Charles, 2026-06-12 — same look and ease of use as the golden file):
+    plain Calibri with a bold header row, the header row frozen, and an
+    auto-filter across all columns. No fills, no custom fonts, no custom
+    column widths — Excel defaults, exactly as the golden file has them.
+    """
+    for row in dataframe_to_rows(df, index=False, header=True):
         ws.append(row)
-        if r_idx == 1:
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(wrap_text=False)
-
-    # Auto-size columns (capped at 50)
-    for col in ws.columns:
-        max_len = max((len(str(cell.value or "")) for cell in col), default=8)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    if len(df):
+        ws.auto_filter.ref = ws.dimensions
 
 
 def build_export(project_dir, region_code, progress_cb=None):
@@ -140,10 +141,13 @@ def build_export(project_dir, region_code, progress_cb=None):
         cols_out[col] = mcol(col)
     cols_out["_blank1"] = blank
     cols_out["_blank2"] = blank
-    # Golden v3 shows 'Y' for a match and BLANK otherwise — not the literal 'N'
-    # the RE flagger writes into the master for every non-match.
-    cols_out["RE Match?"] = mcol("RE Match?").map(lambda v: "Y" if str(v).strip() == "Y" else "")
-    cols_out["Potential"] = mcol("Potential")
+    # Golden RE-column semantics (verified against Leicester v3, 2026-06-12):
+    #   "RE Match?" held the word 'Potential' — the certainty slot. Charles's
+    #   tiers (2026-06-10) are the new layer here: Match / Probable / Potential.
+    #   "Potential" held the matched RE donor's NAME — that display is the
+    #   "matching logic we currently have" Charles said not to lose.
+    cols_out["RE Match?"] = mcol("Potential")   # tier (master keeps it there)
+    cols_out["Potential"] = mcol("RE Name")     # who matched, as golden showed
     cols_out["_blank3"] = blank
     cols_out["Match?"] = sanity                       # golden: sanity check (Yes/No/Tentative)
     cols_out["_Surname_echo"] = mcol("Surname")
@@ -161,6 +165,9 @@ def build_export(project_dir, region_code, progress_cb=None):
         for c in VS_RETURN_COLS:
             cols_out[c] = mcol(c)
         log(f"  VoteSource overlay present — appended {len(VS_RETURN_COLS)} VS column(s)")
+
+    # Internal filter key for the Potential RE Match tab — dropped before write.
+    cols_out["_re_flag"] = mcol("RE Match?").map(lambda v: "Y" if str(v).strip() == "Y" else "")
 
     out = pd.DataFrame(cols_out, index=master.index)
 
@@ -195,6 +202,10 @@ def build_export(project_dir, region_code, progress_cb=None):
 
     out = out.rename(columns=rename_map)
 
+    # Split off the internal RE-filter key before writing.
+    re_mask = out["_re_flag"] == "Y"
+    out = out.drop(columns=["_re_flag"])
+
     # ── Build XLSX ────────────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
 
@@ -211,7 +222,7 @@ def build_export(project_dir, region_code, progress_cb=None):
     log(f"  Sheet 'Y&T': {len(df_yt):,} rows")
 
     # Sheet 3: Potential RE Match
-    df_re = out[out["RE Match?"] == "Y"]
+    df_re = out[re_mask]
     ws_re = wb.create_sheet("Potential RE Match")
     _write_sheet(ws_re, df_re)
     log(f"  Sheet 'Potential RE Match': {len(df_re):,} rows")

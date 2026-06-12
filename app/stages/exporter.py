@@ -266,11 +266,18 @@ def build_export(project_dir, region_code, progress_cb=None):
     _write_sheet(ws_all, out, header_fills, spacer_cols)
     log(f"  Sheet 'ALL': {len(out):,} rows")
 
-    # Sheet 2: Y&T — golden filters on the sanity check (Match? = Yes/Tentative)
-    df_yt = out[out["Match?"].isin(["Yes", "Tentative"])]
+    # Sheet 2: Y&T — sanity check Yes/Tentative AND not RE-flagged. The RE
+    # match takes precedence (Charles, 2026-06-12): existing donors must not
+    # land on the cold-outreach list. Verified against golden — Leicester's 56
+    # flagged UIDs appear on ALL and the RE tab but NEVER on Y&T, even the 48
+    # whose sanity check passed.
+    yt_mask = out["Match?"].isin(["Yes", "Tentative"])
+    df_yt = out[yt_mask & ~re_mask]
     ws_yt = wb.create_sheet("Y&T")
     _write_sheet(ws_yt, df_yt, header_fills, spacer_cols)
-    log(f"  Sheet 'Y&T': {len(df_yt):,} rows")
+    diverted = int((yt_mask & re_mask).sum())
+    log(f"  Sheet 'Y&T': {len(df_yt):,} rows"
+        + (f" ({diverted} RE-flagged row(s) live on the RE tab instead)" if diverted else ""))
 
     # Sheet 3: Potential RE Match
     df_re = out[re_mask]

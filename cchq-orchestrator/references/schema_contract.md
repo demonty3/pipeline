@@ -105,8 +105,11 @@ Matches `Leicester - Data v3.xlsx` exactly. Three tabs:
 
 - **ALL** — every row, full column set below.
 - **Y&T** — rows where the sanity check is Yes/Tentative (deliverable `Match?` ∈
-  {`Yes`, `Tentative`}; internally `Result` ∈ {`Y`, `T`}).
-- **Potential RE Match** — rows where `RE Match?` == `Y`.
+  {`Yes`, `Tentative`}; internally `Result` ∈ {`Y`, `T`}) **and the row is not
+  RE-flagged**. The RE match takes precedence (Charles, 2026-06-12 — verified
+  against golden: Leicester's flagged rows appear only on ALL + the RE tab,
+  never on Y&T): existing donors must not land on the cold-outreach list.
+- **Potential RE Match** — rows where `RE Match?` == `Y` (master-internal flag).
 
 Column order on every tab (note the deliberate **blank spacer columns** and the
 **echo copies** of Surname / First Name / Company Name that sit between the CH

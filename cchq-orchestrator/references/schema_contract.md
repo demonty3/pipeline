@@ -101,7 +101,16 @@ the golden v3 format (see the mapping note below).
 
 ## Stage 8 deliverable layout (the v3 shape — DO NOT drift)
 
-Matches `Leicester - Data v3.xlsx` exactly. Three tabs:
+Matches `Leicester - Data v3.xlsx` exactly. Three tabs, **in golden's order:
+ALL, Potential RE Match, Y&T** (the RE pass comes first). Rows sort by Unique
+ID as (prefix, then number) — golden runs the whole #LE1 block ascending, then
+#LE2, etc. Cell types follow golden where golden is sound: DOB cells are real
+datetimes displayed `mmm-yyyy` ("Feb-1958"); `# Employees` / `Annual Revenue` /
+`Total Funding` / `Company Founded Year` are ints when purely numeric. Two
+deliberate deviations where golden is broken: `Company Number` stays
+zero-padded TEXT (golden stored ints and lost CH leading zeros), and
+appointment/creation dates are real ISO dates (golden contains literal
+`########` strings from a copy-paste artifact). Tabs:
 
 - **ALL** — every row, full column set below.
 - **Y&T** — rows where the sanity check is Yes/Tentative (deliverable `Match?` ∈

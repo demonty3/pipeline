@@ -23,6 +23,9 @@ What's different from the old process:
   way the file is produced changes.
 """
 import os
+import re
+from datetime import datetime
+
 import pandas as pd
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -96,6 +99,13 @@ def _write_sheet(ws, df, header_fills=None, spacer_cols=None):
     """
     for row in dataframe_to_rows(df, index=False, header=True):
         ws.append(row)
+
+    # Date cells get golden's display format ("Feb-1958").
+    for ci, col_name in enumerate(df.columns, start=1):
+        if col_name == "Officer date of birth":
+            for r in range(2, ws.max_row + 1):
+                if isinstance(ws.cell(row=r, column=ci).value, datetime):
+                    ws.cell(row=r, column=ci).number_format = "mmm\\-yyyy"
 
     fill_cache = {}
 
@@ -204,20 +214,18 @@ def build_export(project_dir, region_code, progress_cb=None):
 
     out = pd.DataFrame(cols_out, index=master.index)
 
-    # Sort by Unique ID ascending — this is the golden v3 row order (its rows
-    # run #LE1-0005, 0008, 0009, 0017 … i.e. UID-ascending, NOT company-name
-    # order). Sort on the numeric suffix, not the string: UIDs aren't padded to
-    # a fixed width (#ESSEX-9999 then #ESSEX-10000), so a lexicographic sort
-    # would interleave them wrongly. Rows with no UID (shouldn't happen post
-    # Stage 2) sort to the end. Done before the rename step for consistency with
-    # the rest of the column handling.
+    # Sort by Unique ID (prefix, then number) — the golden v3 row order:
+    # Leicester runs the whole #LE1 block ascending, then #LE2, … #LE5. The
+    # number must sort numerically, not lexicographically: UIDs aren't padded
+    # to a fixed width (#ESSEX-9999 then #ESSEX-10000). Rows whose UID doesn't
+    # parse (shouldn't happen post Stage 2) sort to the end.
     if "Unique ID" in out.columns:
-        uid_num = pd.to_numeric(
-            out["Unique ID"].str.extract(r"(\d+)\s*$", expand=False), errors="coerce"
-        )
-        out = (out.assign(_uid_num=uid_num)
-                  .sort_values("_uid_num", kind="stable", na_position="last")
-                  .drop(columns="_uid_num")
+        parts = out["Unique ID"].str.extract(r"^#?(\w+)-(\d+)\s*$")
+        out = (out.assign(_uid_prefix=parts[0].fillna("￿"),
+                          _uid_num=pd.to_numeric(parts[1], errors="coerce"))
+                  .sort_values(["_uid_prefix", "_uid_num"],
+                               kind="stable", na_position="last")
+                  .drop(columns=["_uid_prefix", "_uid_num"])
                   .reset_index(drop=True))
 
     # Rename internal names to display names for the final file
@@ -234,6 +242,24 @@ def build_export(project_dir, region_code, progress_cb=None):
         rename_map[f"_apollo_{display}"] = display
 
     out = out.rename(columns=rename_map)
+
+    # ── Cell types (golden stores these as real dates/numbers, not text) ─────
+    # Golden's DOB cells are datetimes displayed as "Feb-1958"; its Apollo
+    # numeric columns are ints. Writing them as text leaves Excel's green
+    # "number stored as text" warnings and breaks numeric sorting. Company
+    # Number deliberately STAYS text — golden stored it as int and lost the
+    # leading zeros CH numbers carry ("07142845" became 7142845).
+    def _dob_cell(v):
+        m = re.match(r"^(\d{1,2})/(\d{4})$", str(v).strip())
+        if m and 1 <= int(m.group(1)) <= 12:
+            return datetime(int(m.group(2)), int(m.group(1)), 1)
+        return v
+
+    if "Officer date of birth" in out.columns:
+        out["Officer date of birth"] = out["Officer date of birth"].map(_dob_cell)
+    for _c in ("# Employees", "Annual Revenue", "Total Funding", "Company Founded Year"):
+        if _c in out.columns:
+            out[_c] = out[_c].map(lambda v: int(v) if str(v).isdigit() else v)
 
     # Split off the internal RE-filter key before writing.
     re_mask = out["_re_flag"] == "Y"
@@ -266,7 +292,14 @@ def build_export(project_dir, region_code, progress_cb=None):
     _write_sheet(ws_all, out, header_fills, spacer_cols)
     log(f"  Sheet 'ALL': {len(out):,} rows")
 
-    # Sheet 2: Y&T — sanity check Yes/Tentative AND not RE-flagged. The RE
+    # Sheet 2: Potential RE Match — before Y&T, matching golden's tab order
+    # (the RE pass comes first; its rows are excluded from Y&T below).
+    df_re = out[re_mask]
+    ws_re = wb.create_sheet("Potential RE Match")
+    _write_sheet(ws_re, df_re, header_fills, spacer_cols)
+    log(f"  Sheet 'Potential RE Match': {len(df_re):,} rows")
+
+    # Sheet 3: Y&T — sanity check Yes/Tentative AND not RE-flagged. The RE
     # match takes precedence (Charles, 2026-06-12): existing donors must not
     # land on the cold-outreach list. Verified against golden — Leicester's 56
     # flagged UIDs appear on ALL and the RE tab but NEVER on Y&T, even the 48
@@ -278,12 +311,6 @@ def build_export(project_dir, region_code, progress_cb=None):
     diverted = int((yt_mask & re_mask).sum())
     log(f"  Sheet 'Y&T': {len(df_yt):,} rows"
         + (f" ({diverted} RE-flagged row(s) live on the RE tab instead)" if diverted else ""))
-
-    # Sheet 3: Potential RE Match
-    df_re = out[re_mask]
-    ws_re = wb.create_sheet("Potential RE Match")
-    _write_sheet(ws_re, df_re, header_fills, spacer_cols)
-    log(f"  Sheet 'Potential RE Match': {len(df_re):,} rows")
 
     out_path = os.path.join(project_dir, f"{region_code}_final_deliverable.xlsx")
     wb.save(out_path)

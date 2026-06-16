@@ -762,6 +762,8 @@ def stage3_mark_sent(project_id):
     if not batch_id:
         abort(400)
     db.update_batch_status(batch_id, "sent")
+    if request.headers.get("Accept") == "application/json":
+        return jsonify(ok=True)
     return redirect(url_for("project_detail", project_id=project_id))
 
 

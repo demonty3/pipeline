@@ -317,6 +317,25 @@
           })
           .catch(() => { status.textContent = 'network error — enter manually'; });
       }
+
+      function markBatchSent(btn) {
+        btn.disabled = true;
+        const fd = new FormData();
+        fd.append('batch_id', btn.dataset.batchId);
+        fetch('{{ url_for("stage3_mark_sent", project_id=project.id) }}',
+              { method: 'POST', body: fd, headers: { 'Accept': 'application/json' } })
+          .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+          .then(() => {
+            const badge = btn.closest('tr').querySelector('.badge');
+            badge.textContent = 'sent';
+            badge.className = 'badge badge-sent';
+            btn.outerHTML = '<span style="color:#888;font-size:0.82rem">sent</span>';
+          })
+          .catch(() => {
+            btn.disabled = false;
+            alert('Could not mark batch as sent — try again.');
+          });
+      }
     </script>
   {% else %}
     <button class="btn btn-primary" disabled title="Complete Stage 2 first">Build batches</button>
@@ -339,13 +358,11 @@
         </td>
         <td>
           {% if b.status == 'pending' %}
-          <form method="POST" action="{{ url_for('stage3_mark_sent', project_id=project.id) }}"
-                style="display:inline">
-            <input type="hidden" name="batch_id" value="{{ b.id }}">
-            <button type="submit" class="btn btn-secondary" style="font-size:0.78rem;padding:0.25rem 0.6rem">
-              Mark sent
-            </button>
-          </form>
+          <button type="button" class="btn btn-secondary" data-batch-id="{{ b.id }}"
+                  style="font-size:0.78rem;padding:0.25rem 0.6rem"
+                  onclick="markBatchSent(this)">
+            Mark sent
+          </button>
           {% else %}
           <span style="color:#888;font-size:0.82rem">{{ b.status }}</span>
           {% endif %}

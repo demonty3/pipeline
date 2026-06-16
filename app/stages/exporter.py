@@ -50,6 +50,10 @@ FINAL_CH_COLS = [
     "Company address line one", "Company address locality",
     "Company address country", "Company address post code",
     "Company SIC codes",
+    # Deliberate addition over golden v3 (Harry, 2026-06-12): the readable
+    # industry name derived from the SIC codes at Stage 2 (merge.py). The one
+    # place the deliverable is allowed to differ from the golden layout.
+    "SIC Industry",
 ]
 
 FINAL_ECHO_COLS = ["Surname", "First Name", "Company Name"]  # echo copies

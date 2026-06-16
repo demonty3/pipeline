@@ -642,8 +642,8 @@ def stage3_build(project_id):
 
     pdir = db.project_dir(project_id, project["region_code"])
     rc = project["region_code"]
-    exclude_dissolved = request.form.get("exclude_dissolved") == "on"
-    exclude_non_uk = request.form.get("exclude_non_uk") == "on"
+    # Checkbox sends its `value` attr ("1"), not "on" — accept any non-empty value.
+    exclude_dissolved = bool(request.form.get("exclude_dissolved"))
     # Optional credit budget. Operator types it in, or pre-fills via /apollo/credits.
     # Empty or zero means "no cap".
     credit_budget = request.form.get("credit_budget", type=int)
@@ -661,7 +661,6 @@ def stage3_build(project_id):
             db.add_log(project_id, 3, msg)
 
         batches = build_batches(pdir, rc, exclude_dissolved=exclude_dissolved,
-                                exclude_non_uk=exclude_non_uk,
                                 credit_budget=credit_budget,
                                 batch_size=batch_size, progress_cb=cb)
         for b in batches:

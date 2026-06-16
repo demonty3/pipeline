@@ -283,19 +283,16 @@
       <label style="font-size:0.82rem;margin-right:0.5rem">
         <input type="checkbox" name="exclude_dissolved" value="1" checked> Exclude dissolved companies
       </label>
-      <label style="font-size:0.82rem;margin-right:0.75rem">
-        <input type="checkbox" name="exclude_non_uk" value="1" checked> Exclude non-UK officer addresses
-      </label>
       <label style="font-size:0.82rem;margin-right:0.5rem">
         Credit budget:
         <input type="number" name="credit_budget" id="credit-budget-input"
-               min="0" step="1000" placeholder="optional"
+               min="0" step="1" placeholder="optional"
                style="width:7rem;font-size:0.82rem;padding:0.15rem 0.3rem">
       </label>
       <label style="font-size:0.82rem;margin-right:0.5rem" title="Rows per batch file. Apollo caps at 10,000 — pick lower for parallel uploads.">
         Batch size:
         <input type="number" name="batch_size"
-               min="1" max="10000" step="500" placeholder="10000"
+               min="1" max="10000" step="1" placeholder="10000"
                style="width:6rem;font-size:0.82rem;padding:0.15rem 0.3rem">
       </label>
       <button type="button" class="btn btn-secondary" id="fetch-credits-btn"

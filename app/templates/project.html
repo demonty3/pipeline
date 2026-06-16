@@ -226,11 +226,11 @@
 
   {% if files.master_raw %}
   <p style="margin-top:0.75rem">
-    Master CSV ready:
     <a href="{{ url_for('download_file', project_id=project.id,
                filename='master_' + project.region_code + '_raw.csv') }}" class="dl-link">
-      master_{{ project.region_code }}_raw.csv
+      Stage 2 master — merged officers
     </a>
+    <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_raw.csv</code>
   </p>
   {% endif %}
 
@@ -439,8 +439,9 @@
     <p style="margin-top:0.75rem">
       <a href="{{ url_for('download_file', project_id=project.id,
                  filename='master_' + project.region_code + '_enriched.csv') }}" class="dl-link">
-        Download enriched master
+        Stage 4 master — Apollo-enriched
       </a>
+      <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_enriched.csv</code>
     </p>
     {% endif %}
 
@@ -513,8 +514,9 @@
   <p style="margin-top:0.75rem">
     <a href="{{ url_for('download_file', project_id=project.id,
                filename='master_' + project.region_code + '_classified.csv') }}" class="dl-link">
-      Download classified master
+      Stage 5 master — Y/T/N classified
     </a>
+    <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_classified.csv</code>
     {% if files.class_log %}
     &nbsp;·&nbsp;
     <a href="{{ url_for('download_file', project_id=project.id, filename='classifications_log.csv') }}"
@@ -565,7 +567,7 @@
         {% endif %}
         <a href="{{ url_for('download_file', project_id=project.id,
                    filename='vs_export_' + project.region_code + '.csv') }}"
-           class="dl-link" style="margin-left:0.5rem">Download VS export</a>
+           class="dl-link" style="margin-left:0.5rem">Stage 6 upload — for VoteSource</a>
       </div>
       <form method="POST" action="{{ url_for('stage6_upload_return', project_id=project.id) }}"
             enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
@@ -582,8 +584,9 @@
       {% if files.master_vs %}
       <a href="{{ url_for('download_file', project_id=project.id,
                  filename='master_' + project.region_code + '_vs.csv') }}" class="dl-link">
-        Download VS master
+        Stage 6 master — VoteSource overlay
       </a>
+      <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_vs.csv</code>
       {% endif %}
     {% elif project.stage6_status == 'skipped' %}
       <p style="color:#3730a3">Stage skipped — proceeding without VoteSource overlay.</p>
@@ -646,8 +649,9 @@
         {% if files.master_re %}
         <a href="{{ url_for('download_file', project_id=project.id,
                    filename='master_' + project.region_code + '_re_flagged.csv') }}" class="dl-link">
-          Download RE-flagged master
+          Stage 7 master — RE-flagged
         </a>
+        <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_re_flagged.csv</code>
         {% endif %}
       {% else %}
         <p style="color:#3730a3">Stage skipped — no RE cross-reference.</p>
@@ -702,8 +706,9 @@
   <p style="margin-top:0.75rem">
     <a href="{{ url_for('download_file', project_id=project.id,
                filename=project.region_code + '_final_deliverable.xlsx') }}" class="dl-link">
-      Download {{ project.region_code }}_final_deliverable.xlsx
+      Stage 8 — final deliverable (XLSX)
     </a>
+    <code style="color:#999;font-size:0.75rem">{{ project.region_code }}_final_deliverable.xlsx</code>
   </p>
   {% endif %}
 

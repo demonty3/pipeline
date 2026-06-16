@@ -130,6 +130,7 @@ def new_project():
         project_id = db.create_project(name, region_code, event_date, [])
         pdir = db.project_dir(project_id, region_code)
         os.makedirs(os.path.join(pdir, "postcodes"), exist_ok=True)
+        write_file_guide(pdir, region_code)
         return redirect(url_for("project_detail", project_id=project_id))
 
     return render_template("new_project.html", errors=[], name="", region_code="",
@@ -247,6 +248,75 @@ def delete_project(project_id):
 # File download
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Map the canonical on-disk names to stage-numbered names for the browser's
+# save dialog, so a non-technical operator can tell which stage a downloaded
+# file came from. On-disk names are unchanged — this renames at the edge only.
+_FRIENDLY_PATTERNS = [
+    (r"^results_(.+)\.csv$",          "{rc} — Stage 1 — Companies House {m1}.csv"),
+    (r"^master_.+_raw\.csv$",         "{rc} — Stage 2 — merged officers master.csv"),
+    (r"^apollo_batch_(\d+)\.csv$",    "{rc} — Stage 3 — Apollo upload batch {m1}.csv"),
+    (r"^master_.+_enriched\.csv$",    "{rc} — Stage 4 — Apollo enriched master.csv"),
+    (r"^master_.+_classified\.csv$",  "{rc} — Stage 5 — YTN classified master.csv"),
+    (r"^classifications_log\.csv$",   "{rc} — Stage 5 — audit log.csv"),
+    (r"^vs_export_.+\.(csv|xlsx)$",   "{rc} — Stage 6 — for VoteSource.{m1}"),
+    (r"^master_.+_vs\.csv$",          "{rc} — Stage 6 — VoteSource master.csv"),
+    (r"^master_.+_re_flagged\.csv$",  "{rc} — Stage 7 — RE flagged master.csv"),
+    (r"^.+_final_deliverable\.xlsx$", "{rc} — Stage 8 — final deliverable.xlsx"),
+]
+
+
+def write_file_guide(project_dir, region_code):
+    """
+    Drop a plain-text WHAT_IS_WHAT.txt into the project folder so anyone
+    browsing it (Drive sync, Finder) can tell which stage each file belongs
+    to — the on-disk names themselves are load-bearing and stay unchanged.
+    """
+    rc = region_code
+    guide = f"""WHAT IS WHAT — {rc} project folder
+=================================================
+
+Each pipeline stage writes its own file; nothing is overwritten. A file
+listed below appears once its stage has run.
+
+  postcodes/results_<POSTCODE>.csv   Stage 1 — raw Companies House search,
+                                     one file per postcode area
+  master_{rc}_raw.csv                Stage 2 — all postcodes merged, Unique IDs
+                                     assigned (the spine of everything below)
+  apollo_batch_NNN.csv               Stage 3 — upload these to Apollo (max
+                                     10,000 rows each)
+  master_{rc}_enriched.csv           Stage 4 — Apollo contact data joined on
+  master_{rc}_classified.csv         Stage 5 — sanity check added (Result =
+                                     Y/T/N: is the Apollo contact really this
+                                     director?)
+  classifications_log.csv            Stage 5 — audit trail of every decision
+  vs_export_{rc}.xlsx                Stage 6 — send this to VoteSource
+  master_{rc}_vs.csv                 Stage 6 — VoteSource's return folded in
+  re_export_{rc}.csv                 Stage 7 input — the Raiser's Edge
+                                     constituent list (sensitive — never
+                                     leaves this folder)
+  master_{rc}_re_flagged.csv         Stage 7 — RE match tiers added
+                                     (Match > Probable > Potential)
+  {rc}_final_deliverable.xlsx        Stage 8 — THE HANDOVER FILE (tabs: ALL,
+                                     Y&T, Potential RE Match)
+
+Rule of thumb: the highest-numbered master file is the most complete one.
+Stage 8 always exports from the most complete master that exists.
+"""
+    with open(os.path.join(project_dir, "WHAT_IS_WHAT.txt"), "w") as fh:
+        fh.write(guide)
+
+
+def _friendly_name(filename, region_code):
+    """Stage-numbered download name for a known pipeline file, else unchanged."""
+    base = os.path.basename(filename)
+    for pattern, template in _FRIENDLY_PATTERNS:
+        m = re.match(pattern, base)
+        if m:
+            return template.format(rc=region_code,
+                                   m1=m.group(1) if m.groups() else "")
+    return base
+
+
 @app.route("/project/<int:project_id>/download/<path:filename>")
 def download_file(project_id, filename):
     project = db.get_project(project_id)
@@ -256,7 +326,8 @@ def download_file(project_id, filename):
     full_path = _safe_path(pdir, filename)
     if not os.path.exists(full_path):
         abort(404)
-    return send_file(full_path, as_attachment=True)
+    return send_file(full_path, as_attachment=True,
+                     download_name=_friendly_name(filename, project["region_code"]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1010,7 +1081,7 @@ def stage6_export_vs(project_id):
     return send_file(
         out_path,
         as_attachment=True,
-        download_name=f"vs_export_{rc}.xlsx",
+        download_name=_friendly_name(f"vs_export_{rc}.xlsx", rc),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 

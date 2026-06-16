@@ -1,3 +1,7 @@
+---
+up: "[[Pipeline]]"
+---
+
 # CCHQ pipeline — quickstart for Charles
 
 This is the short version: how to set it up, the one rule that keeps it working,

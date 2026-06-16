@@ -1,3 +1,7 @@
+---
+up: "[[Pipeline]]"
+---
+
 # CCHQ Pipeline — Automation & Handoff Layer
 ### PRD & Implementation Plan · v1 · 2026-06-04
 

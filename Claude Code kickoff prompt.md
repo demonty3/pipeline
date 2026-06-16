@@ -1,3 +1,7 @@
+---
+up: "[[Pipeline]]"
+---
+
 # Claude Code kickoff prompt — CCHQ Business Club Building
 
 Paste everything below the line into a fresh Claude Code session opened in the project folder.

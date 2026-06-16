@@ -1,0 +1,8 @@
+# Windows batch files: store CRLF bytes verbatim so they run correctly on
+# Charles's Windows machine whether the repo is cloned OR downloaded as a ZIP
+# (a ZIP export ignores eol normalization, so we keep the bytes as-is).
+*.bat -text
+*.cmd -text
+
+# Shell scripts stay LF.
+*.sh  text eol=lf

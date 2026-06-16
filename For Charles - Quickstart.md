@@ -17,21 +17,31 @@ file-in / file-out, and keeps the master table shape-compatible with the
 
 ## One-time setup
 
-1. **Install Python deps** (once):
+You only do this once.
 
-   ```bash
-   pip install -r app/requirements.txt
+**Windows:**
+
+1. **Install Python.** Get Python 3.12 from <https://www.python.org/downloads/>.
+   On the **first installer screen, tick "Add python.exe to PATH"**, then finish.
+
+2. **Run setup.** Double-click **`setup.bat`** in the project folder. It builds a
+   local environment and installs everything (takes a minute). Leave the window
+   open until it prints *Setup complete*.
+
+3. **Add your key.** Open **`app\.env`** in Notepad and paste your Companies House
+   key after `CH_API_KEY=`:
+
+   ```
+   CH_API_KEY=your-companies-house-key
    ```
 
-2. **Add your API keys** to `app/.env` (copy `app/.env.example` to start). Never
-   commit this file:
+   That's the only key you need to start. (`APOLLO_API_KEY` is optional — it just
+   powers the live "fetch credits" button; the actual enrichment happens on
+   Apollo's website.) **Never commit `app\.env`** — it holds your secret key.
 
-   ```
-   CH_API_KEY=your-companies-house-key      # Stage 1 (fetch)
-   GEMINI_API_KEY=your-gemini-flash-key      # Stage 5 only (classify) — re-flag is LLM-free
-   ```
+   _Mac/Linux: run `./setup.sh` instead of step 2._
 
-3. **Create the Drive intake folder.** Make a Google Drive folder called
+4. **Create the Drive intake folder.** Make a Google Drive folder called
    **`CCHQ Pipeline Inbox`** and share it with the Google account the assistant's
    Drive connector is signed into. This is where inbound files go (see the rule
    below).
@@ -70,11 +80,9 @@ Two surfaces, one job each:
   ```
 
 - **Open the web app to look (review).** To eyeball the data, check a project's
-  progress, or spot-check the classifier's decisions:
-
-  ```bash
-  cd app && python3 app.py        # then open http://localhost:5050
-  ```
+  progress, or spot-check the classifier's decisions, **double-click `run.bat`**
+  (Mac/Linux: `./run.sh`), then open <http://localhost:5050>. Leave the window
+  open while you use the app; close it to stop.
 
   Both surfaces share the same projects and files — a list the assistant built
   shows up in the web app, and vice versa.
@@ -164,7 +172,7 @@ in the project folder and a ready-to-send note is written to
 - **Loop log & draft emails:** `cchq-orchestrator/state/`.
 
 ## If something stops
-- `ERROR: CH_API_KEY / GEMINI_API_KEY is not set` → add it to `app/.env`.
+- `ERROR: CH_API_KEY is not set` → add it to `app/.env` (see step 3 above).
 - `ERROR: master_<RC>_classified.csv not found — run Stage 5 first` → you skipped
   a stage; run `status` to see where you are and run the missing one.
 - Anything else → run `status`, and the assistant can read the printed log and

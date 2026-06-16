@@ -27,6 +27,7 @@ from stages.classifier import (run_passes_1_and_2, apply_decisions_and_save,
 from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save
 from stages.exporter import build_export
 from stats import project_stats
+from stages.project_merge import merge_projects
 from stages.vs_export import build_vs_export
 from stages.credit_chop import chop_for_credits
 
@@ -135,6 +136,48 @@ def new_project():
 
     return render_template("new_project.html", errors=[], name="", region_code="",
                            event_date="")
+
+
+@app.route("/projects/merge", methods=["POST"])
+def projects_merge():
+    """Merge ≥2 projects into a NEW project (sources untouched). Synchronous —
+    it's a few CSV concats, same weight as a Stage 8 export."""
+    ids = request.form.getlist("merge_ids", type=int)
+    name = request.form.get("merge_name", "").strip()
+    region_code = request.form.get("merge_region_code", "").strip().upper()
+
+    errors = []
+    if len(ids) < 2:
+        errors.append("Tick at least two projects to merge.")
+    if not name:
+        errors.append("The merged project needs a name.")
+    if not re.fullmatch(r"[A-Z0-9]{1,10}", region_code or ""):
+        errors.append("Region/ID prefix must be 1-10 letters or digits (e.g. SWTW).")
+
+    sources = []
+    for pid in ids:
+        p = db.get_project(pid)
+        if not p:
+            errors.append(f"Project {pid} no longer exists.")
+            continue
+        job = _job(pid)
+        if job and job.get("status") == "running":
+            errors.append(f"'{p['name']}' has a stage running — wait for it to finish.")
+        sources.append((p, db.project_dir(pid, p["region_code"])))
+
+    if not errors:
+        try:
+            result = merge_projects(sources, db, name, region_code)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if errors:
+        return render_template("index.html", projects=db.get_all_projects(),
+                               merge_errors=errors, merge_name=name,
+                               merge_region_code=region_code)
+
+    write_file_guide(result["project_dir"], region_code)
+    return redirect(url_for("project_detail", project_id=result["project_id"]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

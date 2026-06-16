@@ -307,6 +307,20 @@ def get_s5_decisions(project_id):
     return by_uid
 
 
+def copy_s5_decisions(src_project_id, dst_project_id):
+    """Duplicate a source project's Stage 5 audit trail onto another project
+    (used by project merge — UIDs are globally distinct across the sources,
+    so the copied rows can't collide)."""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO stage5_decisions
+                   (project_id, unique_id, pass_num, label, confidence, reason, ts)
+               SELECT ?, unique_id, pass_num, label, confidence, reason, ts
+               FROM stage5_decisions WHERE project_id = ? ORDER BY id""",
+            (dst_project_id, src_project_id),
+        )
+
+
 def get_s5_review_queue(project_id):
     """
     Rows that need human review: the latest pass_num=2 record per unique_id,
@@ -387,6 +401,21 @@ def get_s7_decisions(project_id):
     return by_uid
 
 
+
+
+def copy_s7_decisions(src_project_id, dst_project_id):
+    """Duplicate a source project's Stage 7 audit trail onto another project
+    (used by project merge — see copy_s5_decisions)."""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO stage7_decisions
+                   (project_id, unique_id, re_name, match_type, label,
+                    confidence, reason, pass_num, ts)
+               SELECT ?, unique_id, re_name, match_type, label,
+                      confidence, reason, pass_num, ts
+               FROM stage7_decisions WHERE project_id = ? ORDER BY id""",
+            (dst_project_id, src_project_id),
+        )
 
 
 def delete_project(project_id):

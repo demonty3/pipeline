@@ -7,8 +7,8 @@ What it does, in plain English:
   batches — so the operator just picks them up one at a time:
     - Drop duplicate persons (already flagged in Stage 2) so we don't
       pay Apollo twice for the same person
-    - Apply operator pre-filters (skip dissolved companies, non-UK
-      addresses) so credits aren't spent on noise
+    - Apply the operator pre-filter (skip dissolved companies) so
+      credits aren't spent on noise
     - Apply the cleaned form of Company Name (see text_cleanup) to lift
       Apollo's match rate vs. the raw uppercase CH names
     - Split the remainder into ≤10,000-row batch CSVs, each tagged with
@@ -31,13 +31,9 @@ from stages.text_cleanup import clean_company_name
 
 BATCH_SIZE = 10_000  # Apollo's hard per-document cap
 
-# Officer address country values that count as UK.
-UK_COUNTRIES = {"united kingdom", "england", "scotland", "wales", "northern ireland", ""}
-
 
 def build_batches(project_dir, region_code, exclude_dissolved=True,
-                  exclude_non_uk=True, credit_budget=None, batch_size=None,
-                  progress_cb=None):
+                  credit_budget=None, batch_size=None, progress_cb=None):
     """
     Build apollo_batch_NNN.csv files from the Stage 2 master.
 
@@ -45,7 +41,6 @@ def build_batches(project_dir, region_code, exclude_dissolved=True,
         project_dir: absolute path to the project folder
         region_code: e.g. "LE1"
         exclude_dissolved: drop rows where Company Status == 'Dissolved'
-        exclude_non_uk: drop rows where officer address country is not a UK value
         credit_budget: optional int — cap total upload rows at this number to
             stay within Apollo's remaining credit pool. Rows beyond the cap
             are written to apollo_deferred_<region>.csv so the operator can
@@ -70,25 +65,26 @@ def build_batches(project_dir, region_code, exclude_dissolved=True,
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     log(f"Loaded master: {len(master):,} rows")
 
-    # ── Deduplicate: only include the primary row for each person ─────────────
+    # ── Region-wide person dedup: one row per unique person ───────────────────
+    # Stage 2 flags every repeat of a person (same Surname|First|DOB) across ALL
+    # postcodes as an Apollo Duplicate. Uploading only the non-duplicates means
+    # each person is enriched once no matter how many companies they direct —
+    # the fewest possible upload rows (and files). Stage 4 then fans the person's
+    # enrichment back across their other rows on the way in.
     if "Apollo Duplicate" in master.columns:
-        upload_list = master[master["Apollo Duplicate"].str.lower() != "true"].copy()
+        dup_mask = master["Apollo Duplicate"].str.lower() == "true"
+        upload_list = master[~dup_mask].copy()
+        log(f"  Region-wide person dedup: {int(dup_mask.sum()):,} duplicate-person rows held back, "
+            f"{len(upload_list):,} unique people to upload")
     else:
         upload_list = master.copy()
-    log(f"  {len(upload_list):,} rows after dedup filter (Apollo Duplicate == False)")
+        log(f"  {len(upload_list):,} rows (no dedup flag present)")
 
     # ── Optional pre-filters ─────────────────────────────────────────────────
     if exclude_dissolved and "Company Status" in upload_list.columns:
         before = len(upload_list)
         upload_list = upload_list[upload_list["Company Status"].str.strip().str.lower() != "dissolved"]
         log(f"  Excluded dissolved: {before - len(upload_list):,} rows dropped ({len(upload_list):,} remain)")
-
-    if exclude_non_uk and "Officer address country" in upload_list.columns:
-        before = len(upload_list)
-        upload_list = upload_list[
-            upload_list["Officer address country"].str.strip().str.lower().isin(UK_COUNTRIES)
-        ]
-        log(f"  Excluded non-UK: {before - len(upload_list):,} rows dropped ({len(upload_list):,} remain)")
 
     # ── Build Apollo upload columns ────────────────────────────────────────────
     # Column shape matches the canonical SW3 example: Surname, First Name,

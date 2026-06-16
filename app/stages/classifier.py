@@ -2,38 +2,38 @@
 Stage 5 — Y/T/N sanity check (does Apollo's match really refer to this person?).
 
 What it does, in plain English:
-  For every Apollo-matched row, decide whether the Apollo company name
-  actually matches the Companies House company name — i.e. did Apollo
-  find the right person, but at the wrong company. Three-tier cascade:
-    Pass 1: deterministic string similarity (rapidfuzz token-sort ratio)
+  For every Apollo-matched row, decide whether the Apollo contact really is
+  the Companies House officer. Fully deterministic three-tier cascade:
+    Pass 1: string similarity (rapidfuzz token-sort ratio)
             ≥85 → Yes, <45 → No, everything in between → Tentative
-    Pass 2: Gemini Flash judges the Tentative band in batches of 20,
-            returns label (Y/T/N) + confidence (0–1) + one-line reason;
-            confidence ≥0.80 auto-applies
-    Pass 3: only rows still uncertain reach the operator's web UI
+    Pass 2: evidence pass on the Tentative band — core-name agreement
+            (first name + surname match once middle names are ignored),
+            nickname-normalised re-score (Tom↔Thomas, Andy↔Andrew…) and
+            email corroboration (the Apollo email's local part contains
+            the officer's surname).
+            Positive evidence upgrades T → Y; no evidence leaves the row T.
+    Pass 3: rows still Tentative reach the operator's web UI
   Every decision is written to the stage5_decisions DB table and to
   classifications_log.csv for audit.
 
 What's different from the old process:
   Replaces Steps 9 and 15. Used to be: every Apollo-matched row got a
   human Y/T/N decision — ~7,200 rows for Leicester. With this cascade
-  the operator only sees a few hundred genuinely ambiguous ones; the
-  obvious Yes and No are auto-resolved and Gemini handles the rest.
+  the operator only sees the genuinely ambiguous residue; the obvious
+  Yes and No are auto-resolved and the evidence pass clears the
+  nickname/email cases. (An earlier version used Gemini for Pass 2;
+  removed 2026-06-11 — quota stalls made it unreliable, and the evidence
+  pass resolves the same band deterministically.)
 """
 import os
-import json
 import csv
 import re
 import pandas as pd
 from rapidfuzz import fuzz
-import google.generativeai as genai
 
 # Score thresholds
 PASS1_YES = 85    # token_sort_ratio >= this → Y
 PASS1_NO  = 45    # token_sort_ratio < this  → N (middle band → Tentative for Pass 2)
-PASS2_AUTO = 0.70  # Gemini confidence >= this → auto-apply (dropped from 0.80
-                  # so fewer reasonable-but-not-certain matches escalate to human)
-PASS2_BATCH = 20   # row-pairs per Gemini call
 
 # Placeholder strings Apollo writes when it couldn't enrich a row. Treated as
 # empty when building the Apollo name, so a row with "N/A N/A" lands in
@@ -41,19 +41,57 @@ PASS2_BATCH = 20   # row-pairs per Gemini call
 # into the Tentative band and clogging the human review queue.
 APOLLO_NULL = {"", "n/a", "na", "n\\a", "-", "—", "none", "null", "."}
 
-GEMINI_MODEL = "gemini-2.5-flash"
-
-SYSTEM_PROMPT = """You are a data-quality assistant for a UK political campaign database.
-Your task: decide whether an Apollo-enriched record refers to the same person as a UK Companies House officer record.
-
-Rules:
-- Y = strong evidence it is the same person (names clearly match)
-- T = plausible but uncertain (partial name match, common name, etc.)
-- N = different person or no real match
-
-Respond ONLY with a valid JSON array — no prose, no markdown code fences, no extra text.
-Each element must have exactly these keys: unique_id, label, confidence, reason.
-confidence is a float 0.0–1.0. reason is one short sentence."""
+# Common UK first-name variants, mapped to one canonical form. Both names are
+# canonicalised before the Pass-2 re-score, so "Tom Carson" vs "THOMAS CARSON"
+# scores like an exact match. Deliberately modest — only unambiguous pairs.
+NICKNAMES = {
+    "tom": "thomas", "tommy": "thomas",
+    "andy": "andrew", "drew": "andrew",
+    "mike": "michael", "mick": "michael",
+    "bernie": "bernard",
+    "frank": "francis", "fran": "francis",
+    "bob": "robert", "rob": "robert", "bobby": "robert", "robbie": "robert",
+    "bill": "william", "billy": "william", "will": "william",
+    "dave": "david",
+    "steve": "stephen", "steven": "stephen",
+    "jim": "james", "jimmy": "james", "jamie": "james",
+    "jackie": "jacqueline", "jacqui": "jacqueline",
+    "johnny": "john", "jonny": "john",
+    "liz": "elizabeth", "beth": "elizabeth", "lizzie": "elizabeth",
+    "kate": "katherine", "cathy": "katherine", "katie": "katherine",
+    "catherine": "katherine", "kathryn": "katherine",
+    "sue": "susan", "susie": "susan",
+    "tony": "anthony",
+    "nick": "nicholas",
+    "chris": "christopher",
+    "dan": "daniel", "danny": "daniel",
+    "matt": "matthew",
+    "joe": "joseph", "joey": "joseph",
+    "sam": "samuel",
+    "ben": "benjamin",
+    "ed": "edward", "eddie": "edward", "ted": "edward",
+    "pete": "peter",
+    "dick": "richard", "rick": "richard", "richie": "richard",
+    "greg": "gregory",
+    "jen": "jennifer", "jenny": "jennifer",
+    "becky": "rebecca",
+    "vicky": "victoria", "vicki": "victoria",
+    "pat": "patrick",
+    "charlie": "charles", "chuck": "charles",
+    "harry": "henry",
+    "ron": "ronald", "ronnie": "ronald",
+    "don": "donald",
+    "ken": "kenneth", "kenny": "kenneth",
+    "ray": "raymond",
+    "phil": "philip", "phillip": "philip",
+    "gerry": "gerald", "jerry": "gerald",
+    "terry": "terence",
+    "doug": "douglas",
+    "stan": "stanley",
+    "alex": "alexander",
+    "fred": "frederick", "freddie": "frederick",
+    "geoff": "geoffrey", "jeff": "geoffrey",
+}
 
 LOG_COLS = ["unique_id", "pass_num", "label", "confidence", "reason", "officer_name", "apollo_name"]
 
@@ -63,13 +101,18 @@ def _normalise(name):
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", name.lower())).strip()
 
 
-def _apollo_name(row):
+def _apollo_name_parts(row):
     first = str(row.get("Apollo First Name", "")).strip()
     last = str(row.get("Apollo Last Name", "")).strip()
     if first.lower() in APOLLO_NULL:
         first = ""
     if last.lower() in APOLLO_NULL:
         last = ""
+    return first, last
+
+
+def _apollo_name(row):
+    first, last = _apollo_name_parts(row)
     return f"{first} {last}".strip()
 
 
@@ -82,10 +125,10 @@ def _append_log(log_path, entries):
         writer.writerows(entries)
 
 
-def run_passes_1_and_2(project_id, project_dir, region_code, gemini_api_key, progress_cb=None, db=None, cancel_event=None):
+def run_passes_1_and_2(project_id, project_dir, region_code, progress_cb=None, db=None, cancel_event=None):
     """
-    Run Pass 1 (deterministic) and Pass 2 (Gemini) of the classifier.
-    Writes decisions to the DB and classifications_log.csv.
+    Run Pass 1 (fuzzy score) and Pass 2 (deterministic evidence) of the
+    classifier. Writes decisions to the DB and classifications_log.csv.
     Returns a summary dict.
 
     `db` is the database module (passed in to avoid circular import).
@@ -153,180 +196,165 @@ def run_passes_1_and_2(project_id, project_dir, region_code, gemini_api_key, pro
                                  "confidence": score / 100,
                                  "reason": f"Tentative — fuzzy score {score}",
                                  "officer_name": officer, "apollo_name": apollo})
+            apollo_first, apollo_last = _apollo_name_parts(row)
             tentative_rows.append({
                 "unique_id": uid,
                 "officer_name": officer,
                 "apollo_name": apollo,
                 "company_name": str(row.get("Company Name", "")),
+                # Evidence-pass inputs:
+                "surname": str(row.get("Surname", "")).strip(),
+                "first_name": str(row.get("First Name", "")).strip(),
+                "apollo_first": apollo_first,
+                "apollo_last": apollo_last,
+                "apollo_email": str(row.get("Apollo Email", "")).strip(),
             })
             pass1_t += 1
 
     _append_log(log_path, log_entries)
     log(f"Pass 1 done: {pass1_y:,} Y | {pass1_n:,} N | {pass1_t:,} Tentative → Pass 2")
 
-    # ── Pass 2: Gemini Flash ──────────────────────────────────────────────────
+    # ── Pass 2: deterministic evidence ────────────────────────────────────────
     if not tentative_rows:
-        log("No Tentative rows — skipping Gemini pass")
+        log("No Tentative rows — skipping evidence pass")
         return {"pass1_y": pass1_y, "pass1_n": pass1_n, "pass1_t": pass1_t,
-                "pass2_auto": 0, "pass2_review": 0, "aborted_gemini": False}
+                "pass2_y": 0, "pass2_review": 0}
 
-    if not gemini_api_key:
-        log("WARNING: GEMINI_API_KEY not set — all Tentative rows go to human review")
-        for r in tentative_rows:
-            db.log_s5_decision(project_id, r["unique_id"], 2, "T", confidence=0.0,
-                               reason="Gemini not configured — human review required")
-        return {"pass1_y": pass1_y, "pass1_n": pass1_n, "pass1_t": pass1_t,
-                "pass2_auto": 0, "pass2_review": len(tentative_rows),
-                "aborted_gemini": False}
-
-    pass2_auto, pass2_review, pass2_errors, aborted = _run_gemini_pass2(
-        project_id, tentative_rows, gemini_api_key, log_path, db, log, cancel_event,
+    pass2_y, pass2_review = _evidence_pass2(
+        project_id, tentative_rows, log_path, db, log,
     )
 
     return {
         "pass1_y": pass1_y, "pass1_n": pass1_n, "pass1_t": pass1_t,
-        "pass2_auto": pass2_auto, "pass2_review": pass2_review,
-        "aborted_gemini": aborted,
+        "pass2_y": pass2_y, "pass2_review": pass2_review,
     }
 
 
-# Three consecutive batch errors → assume Gemini is down and stop hammering it.
-CONSECUTIVE_ERROR_LIMIT = 3
+def _canonical_first_names(name):
+    """Map every token of a name through the NICKNAMES table."""
+    tokens = _normalise(name).split()
+    return " ".join(NICKNAMES.get(t, t) for t in tokens)
 
 
-def _run_gemini_pass2(project_id, rows, gemini_api_key, log_path, db, log, cancel_event):
+def _surnames_agree(surname, apollo_last):
     """
-    Run Gemini Pass 2 on a list of {unique_id, officer_name, apollo_name, company_name}
-    dicts. Returns (auto, review, errors, aborted_gemini).
-    Shared by the initial run and the retry-failed-rows path.
+    Tri-state surname comparison: None when either side is missing (can't
+    tell), else exact match after normalising, or ≥90 character ratio to
+    tolerate spelling drift (O'Brien/OBrien, hyphens).
     """
-    genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    sn, al = _normalise(surname or ""), _normalise(apollo_last or "")
+    if not (sn and al):
+        return None
+    return sn == al or fuzz.ratio(sn, al) >= 90
 
-    pass2_auto = pass2_review = pass2_errors = 0
+
+def _core_names_agree(surname, first_name, apollo_first, apollo_last):
+    """
+    True when first name + surname agree once middle names are ignored:
+    the officer's surname matches Apollo's last name, and the
+    nickname-canonicalised first names match (exact either way, or ≥90
+    character ratio for spelling drift). Catches the
+    "MASTERS, Stephen Charles Alexander" vs "Steve Masters" band, where
+    middle names drag the full-name fuzzy score under the auto-Y bar —
+    in the TW10 run this pattern was 75 of the 78 rows that reached the
+    human review queue.
+
+    Deliberately structured (surname AND first name must each agree)
+    rather than a fuzzy score over the joined string: "Stephen Bowden"
+    vs "Stephen Brown" must NOT pass, even though a token-sort ratio on
+    the pair clears 85.
+    """
+    if _surnames_agree(surname, apollo_last) is not True:
+        return False
+    fn_toks = _normalise(first_name or "").split()
+    af_toks = _normalise(apollo_first or "").split()
+    if not (fn_toks and af_toks):
+        return False
+    fn = NICKNAMES.get(fn_toks[0], fn_toks[0])
+    af = NICKNAMES.get(af_toks[0], af_toks[0])
+    return fn == af or fuzz.ratio(fn, af) >= 90
+
+
+def _email_corroborates(surname, first_name, email):
+    """
+    True if the Apollo email's local part contains the officer's surname
+    (≥4 letters, to avoid short-surname false hits like "Li") or the
+    officer's first-initial + surname (e.g. hwgsmith@ for Henry Smith —
+    accepted at any surname length because the initial pins it down).
+    """
+    if not email or "@" not in email:
+        return False
+    local = re.sub(r"[^a-z]", "", email.split("@", 1)[0].lower())
+    sn = re.sub(r"[^a-z]", "", (surname or "").lower())
+    if not sn:
+        return False
+    if len(sn) >= 4 and sn in local:
+        return True
+    fi = re.sub(r"[^a-z]", "", (first_name or "").lower())[:1]
+    return bool(fi) and (fi + sn) in local
+
+
+def _evidence_pass2(project_id, rows, log_path, db, log):
+    """
+    Deterministic Pass 2 over the Tentative band. Replaces the old Gemini pass
+    (removed 2026-06-11). Three checks, in order; positive evidence upgrades the
+    row to Y, otherwise it STAYS T and goes to the human review queue. The pass
+    never downgrades to N — absence of evidence is not evidence of mismatch.
+
+    Returns (pass2_y, pass2_review).
+    """
+    pass2_y = pass2_review = 0
     log_entries = []
-    consecutive_errors = 0
-    aborted = False
 
-    batches = [rows[i:i+PASS2_BATCH] for i in range(0, len(rows), PASS2_BATCH)]
-    log(f"Pass 2: {len(rows):,} rows in {len(batches)} Gemini batch(es)")
+    log(f"Pass 2 (evidence): {len(rows):,} Tentative row(s)")
 
-    for b_idx, batch in enumerate(batches):
-        prompt = SYSTEM_PROMPT + "\n\nItems:\n" + json.dumps(batch, ensure_ascii=False)
-        try:
-            resp = model.generate_content(prompt)
-            raw = resp.text.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```[a-z]*\n?", "", raw)
-                raw = re.sub(r"\n?```$", "", raw)
-            decisions = json.loads(raw)
+    for r in rows:
+        uid = r["unique_id"]
+        label, confidence, reason = "T", 0.0, "No deterministic evidence — human review"
 
-            for d in decisions:
-                uid = d.get("unique_id", "")
-                label = str(d.get("label", "T")).strip().upper()
-                confidence = float(d.get("confidence", 0.0))
-                reason = str(d.get("reason", ""))
+        # 1. Core-name agreement: Steve Masters vs MASTERS, Stephen Charles
+        #    Alexander — middle names ignored, surname + first name must agree.
+        if _core_names_agree(r.get("surname", ""), r.get("first_name", ""),
+                             r.get("apollo_first", ""), r.get("apollo_last", "")):
+            label, confidence = "Y", 0.95
+            reason = "Core name match — first name + surname agree (middle names ignored)"
+        else:
+            # A surname that positively disagrees (both sides present, no
+            # match) blocks the fuzzy upgrade below: "Stephen Bowden" vs
+            # "Stephen Brown" token-sorts to 89, but they're different people.
+            # Email corroboration is still allowed through — the officer's own
+            # surname in the mailbox outweighs a changed/married display name.
+            surname_contradicted = _surnames_agree(
+                r.get("surname", ""), r.get("apollo_last", "")) is False
 
-                if label not in ("Y", "T", "N"):
-                    label = "T"
+            # 2. Nickname-normalised re-score: Tom Carson vs THOMAS CARSON.
+            score = fuzz.token_sort_ratio(_canonical_first_names(r["officer_name"]),
+                                          _canonical_first_names(r["apollo_name"]))
+            if score >= PASS1_YES and not surname_contradicted:
+                label, confidence = "Y", score / 100
+                reason = f"Nickname-normalised score {score}"
+            # 3. Email corroboration: david.bennett@… for officer David Bennett.
+            elif _email_corroborates(r.get("surname", ""), r.get("first_name", ""),
+                                     r.get("apollo_email", "")):
+                label, confidence = "Y", 0.9
+                reason = "Email corroborates officer name"
+            elif surname_contradicted:
+                reason = "Apollo surname disagrees with officer — human review"
 
-                db.log_s5_decision(project_id, uid, 2, label, confidence=confidence, reason=reason)
-                log_entries.append({
-                    "unique_id": uid, "pass_num": 2, "label": label,
-                    "confidence": confidence, "reason": reason,
-                    "officer_name": next((r["officer_name"] for r in batch if r["unique_id"] == uid), ""),
-                    "apollo_name": next((r["apollo_name"] for r in batch if r["unique_id"] == uid), ""),
-                })
-
-                if confidence >= PASS2_AUTO:
-                    pass2_auto += 1
-                else:
-                    pass2_review += 1
-
-            consecutive_errors = 0
-
-        except Exception as exc:
-            log(f"  Batch {b_idx + 1} Gemini error: {exc} — {len(batch)} rows sent to review")
-            for r in batch:
-                db.log_s5_decision(project_id, r["unique_id"], 2, "T", confidence=0.0,
-                                   reason=f"Gemini error: {exc}")
-            pass2_errors += len(batch)
-            pass2_review += len(batch)
-            consecutive_errors += 1
-
-            if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
-                remaining = sum(len(b) for b in batches[b_idx + 1:])
-                if remaining:
-                    log(f"  {CONSECUTIVE_ERROR_LIMIT} consecutive Gemini errors — aborting Pass 2. "
-                        f"{remaining:,} rows left untried (use Retry once Gemini is back).")
-                aborted = True
-                break
-
-        if (b_idx + 1) % 10 == 0 or b_idx == len(batches) - 1:
-            log(f"  Pass 2: {b_idx + 1}/{len(batches)} batches done")
-
-        if cancel_event and cancel_event.is_set():
-            log("  Cancelled — stopping after current batch")
-            break
+        db.log_s5_decision(project_id, uid, 2, label, confidence=confidence, reason=reason)
+        log_entries.append({
+            "unique_id": uid, "pass_num": 2, "label": label,
+            "confidence": confidence, "reason": reason,
+            "officer_name": r["officer_name"], "apollo_name": r["apollo_name"],
+        })
+        if label == "Y":
+            pass2_y += 1
+        else:
+            pass2_review += 1
 
     _append_log(log_path, log_entries)
-    log(f"Pass 2 done: {pass2_auto:,} auto-applied | {pass2_review:,} to review | {pass2_errors:,} errors"
-        + (" (aborted)" if aborted else ""))
-
-    return pass2_auto, pass2_review, pass2_errors, aborted
-
-
-def retry_gemini_failed_rows(project_id, project_dir, region_code, gemini_api_key,
-                              db, progress_cb=None, cancel_event=None):
-    """
-    Re-run Pass 2 on rows currently sitting in the review queue because Gemini
-    errored or was not configured the first time round.
-
-    Returns: {"retried": N, "auto_applied": N, "still_in_review": N, "aborted_gemini": bool}
-    """
-    def log(msg):
-        if progress_cb:
-            progress_cb(msg)
-
-    if not gemini_api_key:
-        log("Cannot retry — GEMINI_API_KEY is still not set.")
-        return {"retried": 0, "auto_applied": 0, "still_in_review": 0, "aborted_gemini": True}
-
-    enriched_path = os.path.join(project_dir, f"master_{region_code}_enriched.csv")
-    if not os.path.exists(enriched_path):
-        raise FileNotFoundError(f"master_{region_code}_enriched.csv not found — Stage 4 must have run.")
-
-    master = pd.read_csv(enriched_path, dtype=str, keep_default_na=False)
-    by_uid = {row["Unique ID"]: row for _, row in master.iterrows()}
-
-    queue = db.get_s5_review_queue(project_id)
-    failed = [q for q in queue if (q.get("reason") or "").startswith(("Gemini error", "Gemini not configured"))]
-    if not failed:
-        log("No Gemini-failed rows in the review queue.")
-        return {"retried": 0, "auto_applied": 0, "still_in_review": 0, "aborted_gemini": False}
-
-    log(f"Retrying Gemini on {len(failed):,} failed row(s)")
-
-    rows = []
-    for q in failed:
-        uid = q["unique_id"]
-        row = by_uid.get(uid)
-        if row is None:
-            continue
-        rows.append({
-            "unique_id": uid,
-            "officer_name": str(row.get("Officer name", "")),
-            "apollo_name": _apollo_name(row),
-            "company_name": str(row.get("Company Name", "")),
-        })
-
-    log_path = os.path.join(project_dir, "classifications_log.csv")
-    auto, review, _errors, aborted = _run_gemini_pass2(
-        project_id, rows, gemini_api_key, log_path, db, log, cancel_event,
-    )
-
-    return {"retried": len(rows), "auto_applied": auto,
-            "still_in_review": review, "aborted_gemini": aborted}
+    log(f"Pass 2 done: {pass2_y:,} upgraded to Y | {pass2_review:,} to review")
+    return pass2_y, pass2_review
 
 
 def count_apollo_placeholders_in_queue(project_id, project_dir, region_code, db):

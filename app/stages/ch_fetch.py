@@ -21,6 +21,8 @@ What's different from the old process:
 import csv
 import os
 import time
+import threading
+from collections import deque
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -57,11 +59,111 @@ COLUMNS = [
 ]
 
 CH_BASE = "https://api.company-information.service.gov.uk"
-RATE_SLEEP = 0.17  # ~5.9 req/s
+MAX_429_RETRIES = 6  # retries on rate-limit before giving up on a request
+
+
+class CHRateLimiter:
+    """
+    Process-wide pacer for Companies House.
+
+    CH allows ~600 requests / 5 minutes per API key (~2 req/s sustained). The
+    old approach slept a fixed 0.17s between calls (~5.9 req/s) — nearly 3× over
+    the ceiling. That burned the whole 5-minute budget in ~100s and then ate
+    429s for the rest of every window (see the rate-limit storms in the logs).
+
+    This limiter keeps us *under* the ceiling so throttling rarely happens at
+    all. Two constraints, both checked before every request:
+      - MIN_INTERVAL between consecutive requests (smooths bursts → ~1.8 req/s)
+      - at most MAX_IN_WINDOW requests inside a rolling WINDOW_SECONDS window
+
+    One shared instance (`_LIMITER`) paces *all* fetches in this process, since
+    the 600/5min budget belongs to the API key, not to a single postcode. The
+    lock is held across the sleep on purpose: we want global serialisation of
+    the request rate, not a free-for-all between threads.
+
+    Cross-process caveat: a separate process (e.g. the run_stage CLI) has its
+    own limiter, so running two fetches at once against the same key can still
+    exceed the budget. Single-operator usage = one fetch at a time.
+    """
+    WINDOW_SECONDS = 300.0
+    MAX_IN_WINDOW = 570    # safety margin under CH's 600
+    MIN_INTERVAL = 0.55    # seconds between requests → ~1.8 req/s
+
+    def __init__(self):
+        self._times = deque()   # monotonic timestamps of recent requests
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        """Block until it's safe to make another CH request."""
+        with self._lock:
+            now = time.monotonic()
+
+            # 1) minimum gap since the previous request
+            gap = self.MIN_INTERVAL - (now - self._last)
+            if gap > 0:
+                time.sleep(gap)
+                now = time.monotonic()
+
+            # 2) rolling-window cap
+            cutoff = now - self.WINDOW_SECONDS
+            while self._times and self._times[0] < cutoff:
+                self._times.popleft()
+            if len(self._times) >= self.MAX_IN_WINDOW:
+                sleep_for = self._times[0] + self.WINDOW_SECONDS - now
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                    now = time.monotonic()
+                    cutoff = now - self.WINDOW_SECONDS
+                    while self._times and self._times[0] < cutoff:
+                        self._times.popleft()
+
+            self._times.append(now)
+            self._last = now
+
+
+# Shared across every fetch in this process — see CHRateLimiter docstring.
+_LIMITER = CHRateLimiter()
+
+
+class CHFetchError(Exception):
+    """Unrecoverable Companies House response (e.g. a 429 that never cleared).
+
+    Raised so a throttled/failed search aborts the run loudly instead of being
+    saved as an empty postcode that looks genuinely company-free.
+    """
 
 
 def _auth(api_key):
     return HTTPBasicAuth(api_key, "")
+
+
+def _ch_get(url, params, auth, log=None, max_retries=MAX_429_RETRIES):
+    """
+    GET a Companies House endpoint, retrying on 429 (rate limit) with backoff.
+
+    CH throttles at ~600 requests / 5 minutes and sends 429 when exceeded,
+    usually with a `Retry-After` header (seconds). We sleep that long (or a
+    growing fallback) and retry the same request, so a throttle PAUSES the run
+    instead of being mistaken for "no results". Non-429 responses are returned
+    immediately; the caller decides what to do with them.
+    """
+    attempt = 0
+    while True:
+        _LIMITER.acquire()
+        resp = requests.get(url, params=params, auth=auth, timeout=30)
+        if resp.status_code != 429 or attempt >= max_retries:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            wait = float(retry_after)
+        except (TypeError, ValueError):
+            wait = min(60.0, 5.0 * (2 ** attempt))  # 5,10,20,40,60,60s
+        if log:
+            log(f"  Rate-limited (429) — waiting {wait:.0f}s then retrying "
+                f"(attempt {attempt + 1}/{max_retries})")
+        time.sleep(wait)
+        attempt += 1
 
 
 def _parse_name(raw):
@@ -96,12 +198,26 @@ def _is_corporate(name):
         "INC", "NOMINEES", "TRUSTEES", "NOMINEE", "CUSTODIAN",
     }
     upper = name.upper()
-    # All-caps multi-word names are usually companies
-    words = upper.split()
-    all_caps = sum(1 for w in words if w.isalpha() and w.isupper() and len(w) > 1)
-    if all_caps >= 2:
+    # Match markers as whole TOKENS, not substrings — otherwise a surname that
+    # merely CONTAINS a marker (VINCENT/PRINCE/FINCH contain "INC", CORPE contains
+    # "CORP") gets wrongly dropped as a company. Strip surrounding punctuation so
+    # tokens like "LTD." / "NOMINEES," still match.
+    tokens = {t.strip(",.&-'()\"") for t in upper.split()}
+    if tokens & corporate_markers:
         return True
-    return any(m in upper for m in corporate_markers)
+    # All-caps multi-word names are usually companies. CH gives real people as
+    # "SURNAME, Forename Middlename": the surname (before the comma) is always
+    # caps, the forenames (after it) are mixed case. Company officers are the
+    # company's all-caps name with no comma. So judge "all-caps-ness" on the
+    # FORENAME portion only, in ORIGINAL case.
+    #
+    # The old code did `name.upper()` first and then checked `.isupper()` — which
+    # is true for EVERY word once uppercased, so it flagged anyone with a middle
+    # name ("SMITH, John James") as corporate and silently dropped them. That
+    # discarded the majority of real directors. Do not reintroduce it.
+    forenames = name.split(",", 1)[1] if "," in name else name
+    all_caps = sum(1 for w in forenames.split() if w.isalpha() and w.isupper() and len(w) > 1)
+    return all_caps >= 2
 
 
 def count_area(area, api_key):
@@ -121,6 +237,7 @@ def count_area(area, api_key):
     area_clean = area.strip()
 
     try:
+        _LIMITER.acquire()
         resp = requests.get(
             f"{CH_BASE}/advanced-search/companies",
             params={
@@ -178,7 +295,7 @@ def fetch_postcode(area, api_key, output_path, progress_cb=None):
 
     while True:
         try:
-            resp = requests.get(
+            resp = _ch_get(
                 f"{CH_BASE}/advanced-search/companies",
                 params={
                     "location": area_clean,
@@ -187,7 +304,7 @@ def fetch_postcode(area, api_key, output_path, progress_cb=None):
                     "size": page,
                 },
                 auth=auth,
-                timeout=30,
+                log=log,
             )
             # CH returns 500 (not 404) when pagination runs out
             if resp.status_code == 500:
@@ -196,10 +313,15 @@ def fetch_postcode(area, api_key, output_path, progress_cb=None):
                 log(f"  Area not recognised by Companies House: '{area_clean}'")
                 break
             if resp.status_code != 200:
-                log(f"  Warning: company search returned {resp.status_code} at offset {start}")
-                break
+                # Includes a 429 that survived all retries — abort loudly rather
+                # than silently saving an empty file that looks like a genuinely
+                # company-free postcode.
+                raise CHFetchError(
+                    f"Companies House returned {resp.status_code} at offset {start} "
+                    f"for '{area_clean}' (rate limit may not have cleared)")
 
-            items = resp.json().get("items", [])
+            data = resp.json()
+            items = data.get("items", [])
             if not items:
                 break
 
@@ -209,14 +331,27 @@ def fetch_postcode(area, api_key, output_path, progress_cb=None):
                     seen_numbers.add(num)
                     companies.append(c)
 
-            start += page
-            time.sleep(RATE_SLEEP)
+            # Heartbeat per page so the operator sees the search advancing.
+            total_hits = int(data.get("hits", 0) or 0)
+            if total_hits:
+                log(f"  ...{len(companies):,}/{total_hits:,} companies collected")
+            else:
+                log(f"  ...{len(companies):,} companies collected")
 
-        except Exception as exc:
+            start += page
+
+        except (requests.RequestException, ValueError) as exc:
+            # Transient network blip OR a malformed body (resp.json() or
+            # int(hits) raising) mid-pagination — keep prior behaviour and stop
+            # paging with whatever we've collected, rather than crashing the run.
             log(f"  Error fetching companies at offset {start}: {exc}")
             break
 
-    log(f"  {len(companies)} companies found")
+    log(f"  {len(companies):,} companies found")
+    if companies:
+        est_min = max(1, round(len(companies) * CHRateLimiter.MIN_INTERVAL / 60))
+        log(f"  Fetching officers for {len(companies):,} companies "
+            f"(~{est_min} min at the safe Companies House rate)...")
 
     # ── Step 2: fetch officers for each company ───────────────────────────────
     rows = []
@@ -228,18 +363,17 @@ def fetch_postcode(area, api_key, output_path, progress_cb=None):
         company_postcode = addr.get("postal_code", "")
 
         try:
-            off_resp = requests.get(
+            off_resp = _ch_get(
                 f"{CH_BASE}/company/{num}/officers",
                 params={"items_per_page": 100},
                 auth=auth,
-                timeout=30,
+                log=log,
             )
             if off_resp.status_code != 200:
-                time.sleep(RATE_SLEEP)
+                log(f"  Warning: officers for {num} returned {off_resp.status_code} — skipping")
                 continue
             officers = off_resp.json().get("items", [])
-            time.sleep(RATE_SLEEP)
-        except Exception as exc:
+        except requests.RequestException as exc:
             log(f"  Error fetching officers for {num}: {exc}")
             continue
 
@@ -303,8 +437,9 @@ def fetch_postcode(area, api_key, output_path, progress_cb=None):
                 "Company SIC codes": ", ".join(company.get("sic_codes") or []),
             })
 
-        if (idx + 1) % 50 == 0:
-            log(f"  Processed {idx + 1}/{len(companies)} companies...")
+        if (idx + 1) % 20 == 0 or (idx + 1) == len(companies):
+            log(f"  Officers: {idx + 1:,}/{len(companies):,} companies · "
+                f"{len(rows):,} people so far")
 
     # ── Step 3: write CSV ─────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

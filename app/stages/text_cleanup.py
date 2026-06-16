@@ -22,6 +22,7 @@ _SUFFIXES = [
     "limited", "ltd",
     "plc",
     "llp", "l.l.p.",
+    "llc",
     "lp",
     "cic", "cio", "rtm",
 ]

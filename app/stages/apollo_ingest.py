@@ -42,6 +42,66 @@ APOLLO_RAW_COLS = [
 # Internal names used in the master (prefixed to avoid collision).
 APOLLO_INTERNAL_COLS = [f"Apollo {c}" for c in APOLLO_RAW_COLS]
 
+# Of Apollo's 22 columns, these describe the PERSON (not the company they were
+# enriched against). Stage 3 sends only one row per unique person to Apollo, so
+# only that row comes back enriched; we fan THESE fields out to the person's
+# other directorship rows. The remaining (company-level) Apollo fields are NOT
+# fanned out — each duplicate row is a different company, and copying the
+# representative company's data onto it would be misleading.
+PERSON_LEVEL_APOLLO = [
+    "First Name", "Last Name", "Title", "Person Linkedin Url",
+    "City", "State", "Country", "Email",
+]
+
+
+def _fan_out_person_enrichment(master, log):
+    """
+    Copy person-level Apollo fields from each enriched representative row onto
+    the same person's other rows (their other directorships), keyed by
+    (Surname, First Name, Officer date of birth) — the exact key Stage 2 used to
+    pick which rows to upload. Only blank target cells are filled, so this never
+    overwrites real data and is safe to re-run after every batch ingest.
+
+    Returns the number of rows that received fanned-out enrichment.
+    """
+    person_cols = [f"Apollo {c}" for c in PERSON_LEVEL_APOLLO if f"Apollo {c}" in master.columns]
+    needed = {"Surname", "First Name", "Officer date of birth"}
+    if not person_cols or not needed <= set(master.columns):
+        return 0
+
+    key = (master["Surname"].str.strip().str.lower() + "|"
+           + master["First Name"].str.strip().str.lower() + "|"
+           + master["Officer date of birth"].str.strip())
+    has_data = master[person_cols].apply(lambda r: any(str(v).strip() for v in r), axis=1)
+
+    filled = 0
+    for key_val, idxs in master.groupby(key).groups.items():
+        idxs = list(idxs)
+        if len(idxs) < 2:
+            continue
+        # Skip blank-DOB groups: the key collapses to "surname|first|" when DOB is
+        # absent, which would merge DISTINCT same-name people and fan one person's
+        # contact data onto another. Only fan when the DOB component is present.
+        if str(key_val).rsplit("|", 1)[-1].strip() == "":
+            continue
+        donors = [i for i in idxs if has_data[i]]
+        if not donors:
+            continue
+        src = donors[0]
+        for i in idxs:
+            if i == src:
+                continue
+            changed = False
+            for col in person_cols:
+                if not str(master.at[i, col]).strip() and str(master.at[src, col]).strip():
+                    master.at[i, col] = master.at[src, col]
+                    changed = True
+            if changed:
+                filled += 1
+    if filled:
+        log(f"  Fanned out person enrichment to {filled:,} duplicate-person row(s)")
+    return filled
+
 
 def _name_key(surname: str, first_name: str, company_name: str) -> str:
     """
@@ -79,6 +139,56 @@ def _build_name_index(master: pd.DataFrame) -> dict:
         if key not in idx:
             idx[key] = i
     return idx
+
+
+def _identity_matches(master, idx, surname, first) -> bool:
+    """
+    True if the master row at `idx` is the SAME PERSON the Apollo return row
+    claims. Guards against a Unique ID that points at a different person — the
+    mis-join that happens when the master is renumbered (e.g. a Companies House
+    re-fetch) AFTER the return was generated, so an old UID still exists but now
+    means someone else.
+
+    Surname must match (case-insensitive, trimmed). First Name is only checked
+    when the return supplies one — return files often leave First Name blank, and
+    Surname alone is enough to catch a wrong-person UID.
+    """
+    m_surname = str(master.at[idx, "Surname"]).strip().lower()
+    if surname.strip().lower() != m_surname:
+        return False
+    if first.strip():
+        m_first = str(master.at[idx, "First Name"]).strip().lower()
+        if first.strip().lower() != m_first:
+            return False
+    return True
+
+
+def _uid_surname_conflict(master, apollo) -> tuple:
+    """
+    Pre-flight check: of an Apollo file's rows whose (non-blank) Unique ID exists
+    in the master, how many disagree with the master on Surname? Returns
+    (checked, mismatched). A high ratio means the file was produced against a
+    DIFFERENTLY NUMBERED master and ingesting it by UID would mis-join wholesale.
+    """
+    if "Unique ID" not in apollo.columns or "Surname" not in apollo.columns:
+        return 0, 0
+    uid_to_surname = {str(master.at[i, "Unique ID"]).strip():
+                      str(master.at[i, "Surname"]).strip().lower()
+                      for i in range(len(master))}
+    checked = mism = 0
+    for _, row in apollo.iterrows():
+        uid = str(row.get("Unique ID", "")).strip()
+        sn = str(row.get("Surname", "")).strip().lower()
+        if uid and sn and uid in uid_to_surname:
+            checked += 1
+            if uid_to_surname[uid] != sn:
+                mism += 1
+    return checked, mism
+
+
+# If more than this fraction of a file's UID-matchable rows disagree on Surname,
+# the file was almost certainly generated against a renumbered master — refuse it.
+UID_CONFLICT_REFUSE_THRESHOLD = 0.30
 
 
 def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progress_cb=None):
@@ -129,29 +239,56 @@ def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progres
 
     log(f"Apollo result: {len(apollo):,} rows, columns: {list(apollo.columns[:6])}...")
 
+    # See ingest_multiple: read enrichment from Apollo's ".1" copy when the
+    # uploaded header collides, so we don't fabricate Apollo data from the
+    # preserved upload columns. Matching below still uses the preserved columns.
+    apollo_src = {c: (f"{c}.1" if f"{c}.1" in apollo.columns else c)
+                  for c in APOLLO_RAW_COLS if c in apollo.columns or f"{c}.1" in apollo.columns}
+
+    # Pre-flight: refuse a file that was generated against a renumbered master.
+    checked, mism = _uid_surname_conflict(master, apollo)
+    if checked and mism / checked > UID_CONFLICT_REFUSE_THRESHOLD:
+        raise ValueError(
+            f"{mism:,}/{checked:,} rows in this file carry a Unique ID whose "
+            f"Surname disagrees with this master. The master was almost certainly "
+            f"RENUMBERED after this file was produced (e.g. a Companies House "
+            f"re-fetch). Refusing to ingest by Unique ID to avoid mis-joining "
+            f"enrichment onto the wrong people. Re-export the return against the "
+            f"current master, or re-key it by name."
+        )
+
     uid_matched = 0
     name_matched = 0
+    uid_mismatch = 0
     unmatched = 0
     orphan_rows = []
 
     for _, row in apollo.iterrows():
         idx = None
-        uid = str(row.get("Unique ID", "")).strip()
+        uid     = str(row.get("Unique ID", "")).strip()
+        surname = str(row.get("Surname", "")).strip()
+        first   = str(row.get("First Name", "")).strip()
+        company = str(row.get("Company Name", "")).strip()
+
+        # UID join — but only if it points at the SAME person. A UID that exists
+        # yet names a different person is a renumber artefact; reject it and let
+        # the name fallback handle the row.
         if uid and uid in uid_to_idx:
-            idx = uid_to_idx[uid]
-            uid_matched += 1
-        else:
-            # Fall back to name-match. Uses the file's preserved-from-batch
-            # Surname / First Name / Company Name columns (NOT Apollo's
-            # enriched "Last Name" / "Company Name" outputs, which can differ).
-            surname = str(row.get("Surname", "")).strip()
-            first   = str(row.get("First Name", "")).strip()
-            company = str(row.get("Company Name", "")).strip()
-            if surname and first and company:
-                key = _name_key(surname, first, company)
-                if key in name_to_idx:
-                    idx = name_to_idx[key]
-                    name_matched += 1
+            cand = uid_to_idx[uid]
+            if _identity_matches(master, cand, surname, first):
+                idx = cand
+                uid_matched += 1
+            else:
+                uid_mismatch += 1
+
+        # Fall back to name-match. Uses the file's preserved-from-batch
+        # Surname / First Name / Company Name columns (NOT Apollo's enriched
+        # "Last Name" / "Company Name" outputs, which can differ).
+        if idx is None and surname and first and company:
+            key = _name_key(surname, first, company)
+            if key in name_to_idx:
+                idx = name_to_idx[key]
+                name_matched += 1
 
         if idx is None:
             orphan_rows.append(row.to_dict())
@@ -159,14 +296,22 @@ def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progres
             continue
 
         for raw_col, internal_col in zip(APOLLO_RAW_COLS, APOLLO_INTERNAL_COLS):
-            if raw_col in apollo.columns:
-                val = str(row.get(raw_col, "")).strip()
-                if val:  # don't overwrite a pre-populated value with a blank
+            src_col = apollo_src.get(raw_col)
+            if src_col:
+                val = str(row.get(src_col, "")).strip()
+                # Blank-fill only: never overwrite an existing value, so the same
+                # person enriched in two files is first-wins, not last-wins.
+                if val and not str(master.at[idx, internal_col]).strip():
                     master.at[idx, internal_col] = val
 
     matched = uid_matched + name_matched
     log(f"  Matched: {matched:,} ({uid_matched:,} by Unique ID, "
-        f"{name_matched:,} by name fallback) | Unmatched/orphan: {unmatched:,}")
+        f"{name_matched:,} by name fallback) | "
+        f"UID→wrong-person rejected: {uid_mismatch:,} | Unmatched/orphan: {unmatched:,}")
+    if uid_mismatch:
+        log(f"  WARNING: {uid_mismatch:,} rows carried a Unique ID that exists in "
+            f"the master but names a DIFFERENT person — not applied via UID "
+            f"(likely a master renumbered after this return was generated).")
 
     # Guardrail: refuse only if BOTH UID and name-match failed for every row.
     # That's the genuine "wrong file" case — completely different people.
@@ -185,6 +330,9 @@ def ingest_batch(project_dir, region_code, apollo_result_path, batch_id, progres
         orphan_path = os.path.join(project_dir, f"apollo_orphans_batch{batch_id}.csv")
         pd.DataFrame(orphan_rows).to_csv(orphan_path, index=False)
         log(f"  {unmatched:,} orphan rows written to {os.path.basename(orphan_path)}")
+
+    # Fan person-level enrichment out across each person's other directorships.
+    _fan_out_person_enrichment(master, log)
 
     # Save enriched master
     master.to_csv(enriched_path, index=False)
@@ -217,9 +365,11 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
 
     uid_to_idx = {uid: i for i, uid in enumerate(master["Unique ID"])}
     name_to_idx = _build_name_index(master)
-    matched = uid_matched = name_matched = unmatched = total = 0
+    matched = uid_matched = name_matched = uid_mismatch = unmatched = total = 0
     orphans = []
     bad_files = []  # files where >0 rows but 0 matched — wrong-file uploads
+    seen_uid_file = {}   # uid -> first filename that claimed it (overlap detection)
+    overlap_count = 0
 
     for path in file_paths:
         try:
@@ -229,26 +379,60 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
             continue
         total += len(apollo)
         log(f"  {os.path.basename(path)}: {len(apollo):,} rows")
+
+        # Pre-flight: refuse a file produced against a renumbered master. Raised
+        # before any master.to_csv(), so a bad upload leaves the master untouched.
+        checked, mism = _uid_surname_conflict(master, apollo)
+        if checked and mism / checked > UID_CONFLICT_REFUSE_THRESHOLD:
+            raise ValueError(
+                f"{os.path.basename(path)}: {mism:,}/{checked:,} rows have a Unique "
+                f"ID whose Surname disagrees with this master. The master was almost "
+                f"certainly RENUMBERED after this file was produced. Refusing to "
+                f"ingest by Unique ID to avoid mis-joining enrichment onto the wrong "
+                f"people. Re-export the return against the current master, or re-key "
+                f"it by name."
+            )
+        # Apollo's enriched columns come AFTER the preserved upload columns; on a
+        # header collision (Apollo also emits "First Name"/"Company Name") pandas
+        # suffixes the Apollo copy ".1". Read enrichment from that copy — otherwise
+        # we pull the uploaded CH value into the Apollo field and fabricate Apollo
+        # data for rows Apollo never matched. (Matching below uses preserved cols.)
+        apollo_src = {c: (f"{c}.1" if f"{c}.1" in apollo.columns else c)
+                      for c in APOLLO_RAW_COLS if c in apollo.columns or f"{c}.1" in apollo.columns}
         file_matched = 0
         file_uid_matched = 0
         file_name_matched = 0
+        fname = os.path.basename(path)
         for _, row in apollo.iterrows():
             idx = None
-            uid = str(row.get("Unique ID", "")).strip()
+            uid     = str(row.get("Unique ID", "")).strip()
+            surname = str(row.get("Surname", "")).strip()
+            first   = str(row.get("First Name", "")).strip()
+            company = str(row.get("Company Name", "")).strip()
+
+            # Track cross-file UID overlap (informational — explains first-wins).
+            if uid:
+                if uid in seen_uid_file and seen_uid_file[uid] != fname:
+                    overlap_count += 1
+                else:
+                    seen_uid_file.setdefault(uid, fname)
+
+            # UID join — only when it names the SAME person (reject renumber drift).
             if uid and uid in uid_to_idx:
-                idx = uid_to_idx[uid]
-                file_uid_matched += 1
-                uid_matched += 1
-            else:
-                surname = str(row.get("Surname", "")).strip()
-                first   = str(row.get("First Name", "")).strip()
-                company = str(row.get("Company Name", "")).strip()
-                if surname and first and company:
-                    key = _name_key(surname, first, company)
-                    if key in name_to_idx:
-                        idx = name_to_idx[key]
-                        file_name_matched += 1
-                        name_matched += 1
+                cand = uid_to_idx[uid]
+                if _identity_matches(master, cand, surname, first):
+                    idx = cand
+                    file_uid_matched += 1
+                    uid_matched += 1
+                else:
+                    uid_mismatch += 1
+
+            if idx is None and surname and first and company:
+                key = _name_key(surname, first, company)
+                if key in name_to_idx:
+                    idx = name_to_idx[key]
+                    file_name_matched += 1
+                    name_matched += 1
 
             if idx is None:
                 orphans.append(row.to_dict())
@@ -256,16 +440,19 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
                 continue
 
             for raw, internal in zip(APOLLO_RAW_COLS, APOLLO_INTERNAL_COLS):
-                if raw in apollo.columns:
-                    val = str(row.get(raw, "")).strip()
-                    if val:  # don't overwrite pre-populated value with blank
+                src = apollo_src.get(raw)
+                if src:
+                    val = str(row.get(src, "")).strip()
+                    # Blank-fill only: never overwrite an existing value (first
+                    # file wins) so two uploads of the same UID don't clobber.
+                    if val and not str(master.at[idx, internal]).strip():
                         master.at[idx, internal] = val
             matched += 1
             file_matched += 1
         log(f"    → {file_matched:,} matched ({file_uid_matched:,} UID, "
             f"{file_name_matched:,} name fallback)")
         if len(apollo) > 0 and file_matched == 0:
-            bad_files.append((os.path.basename(path), len(apollo)))
+            bad_files.append((fname, len(apollo)))
 
     # Guardrail: refuse the whole upload if any file had >0 rows but 0 matches.
     # Doing it AFTER the loop so the error message can list every bad file at once.
@@ -287,8 +474,20 @@ def ingest_multiple(project_dir, region_code, file_paths, progress_cb=None):
         pd.DataFrame(orphans).to_csv(orphan_path, index=False)
         log(f"  {unmatched:,} orphan rows → apollo_orphans_multi.csv")
 
+    # Fan person-level enrichment out across each person's other directorships.
+    _fan_out_person_enrichment(master, log)
+
+    if uid_mismatch:
+        log(f"  WARNING: {uid_mismatch:,} rows carried a Unique ID that exists in "
+            f"the master but names a DIFFERENT person — not applied via UID "
+            f"(likely a master renumbered after these returns were generated).")
+    if overlap_count:
+        log(f"  Note: {overlap_count:,} Unique IDs appeared in more than one input "
+            f"file; blank-fill 'first file wins' was applied to those rows.")
+
     master.to_csv(enriched_path, index=False)
     log(f"Done: {matched:,} matched ({uid_matched:,} UID, {name_matched:,} name "
-        f"fallback), {unmatched:,} orphans from {len(file_paths)} file(s)")
+        f"fallback), {uid_mismatch:,} UID→wrong-person rejected, {unmatched:,} "
+        f"orphans from {len(file_paths)} file(s)")
     return {"matched": matched, "unmatched": unmatched, "total_rows": total,
-            "files_processed": len(file_paths)}
+            "files_processed": len(file_paths), "uid_mismatch": uid_mismatch}

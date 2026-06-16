@@ -80,6 +80,12 @@ h2 { font-size: 1.1rem; margin: 0; }
 .btn-danger-sm:hover { background: #fee2e2; }
 
 /* Badges */
+.card {
+  background: #fff;
+  border: 1px solid #e2e2e2;
+  border-radius: 6px;
+}
+
 .badge {
   display: inline-block;
   padding: 0.2rem 0.55rem;
@@ -131,6 +137,56 @@ h2 { font-size: 1.1rem; margin: 0; }
 
 .pc-table td { font-size: 0.82rem; }
 .log-msg { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #555; }
+
+/* Stats strip — one headline number per stage, on the project page */
+.stats-strip {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 1px;
+  background: #e2e2e2;          /* shows through the gaps as hairline dividers */
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  margin-bottom: 1.25rem;
+}
+.stat {
+  display: block;
+  background: #fff;
+  padding: 0.55rem 0.7rem 0.5rem;
+  text-decoration: none;
+  color: inherit;
+  min-width: 0;
+}
+.stat:hover { background: #fafafa; }
+.stat-label {
+  display: block;
+  font-size: 0.64rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  white-space: nowrap;
+}
+.stat-value {
+  display: block;
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: #1a1a2e;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.stat-sub {
+  display: block;
+  font-size: 0.68rem;
+  color: #777;
+  line-height: 1.35;
+  min-height: 0.95rem;          /* keeps cells level when a sub-line is empty */
+  font-variant-numeric: tabular-nums;
+}
+.stat-empty .stat-value { color: #c4c4c4; font-weight: 500; }
+@media (max-width: 880px) {
+  .stats-strip { grid-template-columns: repeat(4, 1fr); }
+}
 
 /* Stage cards */
 .stage-card {
@@ -190,6 +246,48 @@ h2 { font-size: 1.1rem; margin: 0; }
   line-height: 1.6;
 }
 .ts { color: #6b7280; margin-right: 0.5rem; }
+
+/* Live terminal — streams the running postcode's full log during a fetch */
+.live-terminal {
+  margin-top: 1rem;
+  background: #1a1a1a;
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+.live-terminal-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  background: #0f0f0f;
+  color: #d4d4d4;
+  font-size: 0.78rem;
+  font-family: monospace;
+  border-bottom: 1px solid #2a2a2a;
+}
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 6px #4ade80;
+  animation: live-pulse 1.4s ease-in-out infinite;
+}
+@keyframes live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+.live-terminal-body {
+  margin: 0;
+  background: #1a1a1a;
+  color: #d4d4d4;
+  padding: 0.75rem;
+  font-family: monospace;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  max-height: 320px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* Misc */
 .empty { color: #666; }

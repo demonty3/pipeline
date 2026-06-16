@@ -22,7 +22,7 @@ Stages (run in order; each gates on the previous one's output file):
     merge                     Stage 2 — regional merge + Unique IDs + SIC labels
     magazine [--budget N]     Stage 3 — build Apollo upload batches (<=10k each)
     ingest   --files a.csv... Stage 4 — re-stitch Apollo's enriched exports
-    classify                  Stage 5 — Y/T/N classifier (deterministic+Gemini)
+    classify                  Stage 5 — Y/T/N classifier (fully deterministic)
     vs-export                 Stage 6a — build the VoteSource upload (Y/T rows)
     vs-return --file r.csv    Stage 6b — fold a returned VoteSource file back in
     re-flag  --file re.csv    Stage 7 — Raiser's Edge fuzzy flagger
@@ -31,17 +31,19 @@ Stages (run in order; each gates on the previous one's output file):
 
 Environment (put these in app/.env or the real environment):
     CH_API_KEY        Companies House API key  (Stage 1)
-    GEMINI_API_KEY    Gemini Flash key         (Stages 5 & 7 second pass)
 
 Design notes
 ------------
 - Every command prints stage progress to stdout (the stage modules' own
   ``progress_cb`` log lines) so Claude can read what happened and decide the
   next move. The last line of a successful run is ``OK <stage>``.
-- Stages 5 and 7 use a deterministic -> Gemini -> human cascade. This runner
-  applies the deterministic + Gemini passes and then auto-applies decisions.
+- Stage 5 is fully deterministic: fuzzy score -> evidence pass (nicknames +
+  email corroboration) -> human review. No LLM anywhere in the pipeline.
   Any rows the cascade leaves in the human-review band are reported in the
   summary and written to the review queue; rerun ``status`` to see counts.
+- Stage 7 is a single deterministic pass (no Gemini, no review queue) — RE
+  donor data must never reach an LLM. Every hit gets a certainty tier
+  (Match / Probable / Potential); see references/schema_contract.md.
 """
 import argparse
 import json
@@ -54,7 +56,7 @@ PROJECT_ROOT = os.path.dirname(SKILL_DIR)
 APP_DIR = os.path.join(PROJECT_ROOT, "app")
 sys.path.insert(0, APP_DIR)
 
-# Load app/.env if present (so CH_API_KEY / GEMINI_API_KEY are available).
+# Load app/.env if present (so CH_API_KEY is available).
 _env_path = os.path.join(APP_DIR, ".env")
 if os.path.exists(_env_path):
     for _line in open(_env_path):
@@ -68,10 +70,12 @@ from stages.ch_fetch import fetch_postcode  # noqa: E402
 from stages.merge import run_merge  # noqa: E402
 from stages.apollo_magazine import build_batches  # noqa: E402
 from stages.apollo_ingest import ingest_multiple  # noqa: E402
-from stages.classifier import run_passes_1_and_2, apply_decisions_and_save  # noqa: E402
+from stages.classifier import (  # noqa: E402
+    run_passes_1_and_2, apply_decisions_and_save,
+)
 from stages.vs_export import build_vs_export  # noqa: E402
 from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save  # noqa: E402
-from stages.exporter import build_export  # noqa: E402
+from stages.exporter import build_export, _pick_master  # noqa: E402
 
 
 def log(msg):
@@ -105,6 +109,24 @@ def require_env(key):
 
 # ── Stage handlers ──────────────────────────────────────────────────────────
 
+def _warn_if_blank(path, column, label, threshold=0.20):
+    """Warn loudly if a load-bearing column is largely blank. Catches a Stage-1
+    pull that silently returned no company names (one SW1 demo area came back
+    0/441) — Company Name drives Apollo name-matching and the deliverable, so a
+    blank column quietly degrades downstream output with no other signal."""
+    import pandas as pd
+    if not os.path.exists(path):
+        return
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    if column not in df.columns or len(df) == 0:
+        return
+    blank = int((df[column].astype(str).str.strip() == "").sum())
+    if blank and blank / len(df) > threshold:
+        log(f"WARNING: {label}: {blank:,}/{len(df):,} rows ({blank/len(df)*100:.0f}%) "
+            f"have a blank '{column}'. This degrades Apollo name-matching and the "
+            f"deliverable — check the Companies House pull for this area.")
+
+
 def stage_fetch(pid, pdir, region, args):
     api_key = require_env("CH_API_KEY")
     area = args.area or region
@@ -112,17 +134,29 @@ def stage_fetch(pid, pdir, region, args):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"results_{area}.csv")
     n = fetch_postcode(area, api_key, out_path, progress_cb=log)
+    _warn_if_blank(out_path, "Company Name", f"fetch {area}")
     db.update_stage1_status(pid, "complete")
     log(f"OK fetch — {area}: {n} rows -> {out_path}")
 
 
 def stage_merge(pid, pdir, region, args):
-    start = db.get_project(pid).get("unique_id_counter", 0) or 0
+    raw_path = os.path.join(pdir, f"master_{region}_raw.csv")
+    if os.path.exists(raw_path) and not args.force:
+        log(f"ERROR: {os.path.basename(raw_path)} already exists. Re-running merge "
+            f"reassigns every Unique ID, which orphans the Stage 5/7 decisions keyed "
+            f"to the old IDs and breaks the deliverable's join. Pass --force to rebuild "
+            f"from scratch (Unique IDs restart at #{region}-0001). If you only added "
+            f"new postcodes, use the app's Unique-ID backfill/repair instead.")
+        sys.exit(2)
+    # On a forced rebuild restart the counter, so the same input yields the same
+    # IDs; otherwise continue from the project's last-used counter.
+    start = 0 if args.force else (db.get_project(pid).get("unique_id_counter", 0) or 0)
     rows, new_counter = run_merge(
         pdir, region, id_prefix=args.id_prefix or region,
         starting_counter=start, progress_cb=log,
     )
     db.set_unique_id_counter(pid, new_counter)
+    _warn_if_blank(raw_path, "Company Name", f"merge {region}")
     db.update_stage2_status(pid, "complete")
     log(f"OK merge — {rows} rows, Unique IDs through #{region}-{new_counter:04d}")
 
@@ -145,7 +179,7 @@ def stage_ingest(pid, pdir, region, args):
 
 
 def _write_audit(pdir, name, queue_rows, fields):
-    """Dump the low-confidence rows Gemini auto-resolved to an audit CSV so the
+    """Dump the rows left in the review band to an audit CSV so the
     'no human in the loop' decision stays traceable (scope requires logging
     every decision). Returns the path, or None if there was nothing to write."""
     import csv
@@ -161,12 +195,11 @@ def _write_audit(pdir, name, queue_rows, fields):
 
 
 def stage_classify(pid, pdir, region, args):
-    key = require_env("GEMINI_API_KEY")
-    run_passes_1_and_2(pid, pdir, region, key, progress_cb=log, db=db)
+    run_passes_1_and_2(pid, pdir, region, progress_cb=log, db=db)
     rows = apply_decisions_and_save(pid, pdir, region, db)
-    # No human gate: apply_decisions_and_save already wrote Gemini's label for
-    # every row (low-confidence included; missing -> 'T'). The "review queue" is
-    # just the low-confidence band — we auto-accept Gemini's call and log it.
+    # No human gate: apply_decisions_and_save already wrote a label for every
+    # row (missing -> 'T'). The "review queue" is the no-evidence Tentative
+    # band — we keep those as T and log them for audit.
     queue = db.get_s5_review_queue(pid)
     audit = _write_audit(pdir, f"stage5_autoresolved_{region}.csv", queue,
                          ["unique_id", "label", "confidence", "reason"])
@@ -177,7 +210,7 @@ def stage_classify(pid, pdir, region, args):
     db.update_stage5_status(pid, "complete")
     log(f"OK classify — {rows} rows fully classified (no human gate). "
         f"Y/T/N = {counts.get('Y', 0)}/{counts.get('T', 0)}/{counts.get('N', 0)}; "
-        f"{len(queue)} low-confidence rows auto-accepted from Gemini"
+        f"{len(queue)} no-evidence rows left Tentative"
         + (f" -> audit: {os.path.basename(audit)}" if audit else ""))
 
 
@@ -202,7 +235,17 @@ def stage_vs_return(pid, pdir, region, args):
         sys.exit(2)
     drop = [c for c in vs.columns if not c or (isinstance(c, str) and c.startswith("Unnamed:"))]
     vs = vs.drop(columns=drop) if drop else vs
+    # A duplicated Unique ID in the return file would multiply master rows on the
+    # left-merge below, breaking the "never re-order or filter rows" contract.
+    dup_ct = int(vs["Unique ID"].duplicated().sum())
+    if dup_ct:
+        log(f"WARNING: VS return has {dup_ct} duplicate Unique ID row(s); "
+            f"keeping the first of each")
+        vs = vs.drop_duplicates(subset="Unique ID", keep="first")
     classified = os.path.join(pdir, f"master_{region}_classified.csv")
+    if not os.path.exists(classified):
+        log(f"ERROR: {os.path.basename(classified)} not found — run Stage 5 (classify) first.")
+        sys.exit(2)
     master = pd.read_csv(classified, dtype=str, keep_default_na=False)
     new_cols = [c for c in vs.columns if c != "Unique ID" and c not in master.columns]
     master = master.merge(vs[["Unique ID"] + new_cols], on="Unique ID", how="left")
@@ -214,23 +257,17 @@ def stage_vs_return(pid, pdir, region, args):
 
 
 def stage_re_flag(pid, pdir, region, args):
-    key = require_env("GEMINI_API_KEY")
+    # Deterministic tiering only — RE donor data is highly sensitive and must
+    # never reach an LLM (Charles, 2026-06-10). No API key, no human gate:
+    # every hit lands on the Potential RE Match tab with its certainty tier
+    # (Match / Probable / Potential) so we err toward over-flagging.
     if not args.file:
         log("ERROR: --file is required (the Raiser's Edge export)")
         sys.exit(2)
-    summary = run_re_flagging(pid, pdir, region, args.file, key, progress_cb=log, db=db)
+    summary = run_re_flagging(pid, pdir, region, args.file, progress_cb=log, db=db)
     apply_re_decisions_and_save(pid, pdir, region, db)
-    # No human gate here either: apply_re_decisions_and_save resolves every row
-    # from Gemini's latest call. Low-confidence matches still get flagged Y with
-    # Match?='human' so they surface on the Potential RE Match tab — we err
-    # toward over-flagging a possible existing-donor match. Logged for audit.
-    queue = db.get_s7_review_queue(pid)
-    audit = _write_audit(pdir, f"stage7_autoresolved_{region}.csv", queue,
-                         ["unique_id", "re_name", "label", "confidence", "reason"])
     db.update_stage7_status(pid, "complete")
-    log(f"OK re-flag — {json.dumps(summary)}; "
-        f"{len(queue)} low-confidence flags auto-accepted from Gemini"
-        + (f" -> audit: {os.path.basename(audit)}" if audit else ""))
+    log(f"OK re-flag — {json.dumps(summary)}")
 
 
 def stage_export(pid, pdir, region, args):
@@ -245,14 +282,9 @@ def stage_summary(pid, pdir, region, args):
     Gmail create_draft tool once compose scope is granted; until then the text
     sits locally so nothing is lost. Pure read — never mutates the pipeline."""
     import pandas as pd
-    from stages.exporter import MASTER_SUFFIXES
-    master_path = None
-    for suffix in MASTER_SUFFIXES:
-        cand = os.path.join(pdir, f"master_{region}_{suffix}.csv")
-        if os.path.exists(cand):
-            master_path = cand
-            break
-    if not master_path:
+    try:
+        master_path, _ = _pick_master(pdir, region)
+    except FileNotFoundError:
         log("ERROR: no master file — run at least Stage 2 first.")
         sys.exit(2)
     m = pd.read_csv(master_path, dtype=str, keep_default_na=False)
@@ -321,6 +353,9 @@ def main():
     ap.add_argument("--budget", type=int, help="Apollo credit budget cap for `magazine`")
     ap.add_argument("--files", nargs="+", help="Apollo enriched CSV(s) for `ingest`")
     ap.add_argument("--file", help="Single input file for `vs-return` / `re-flag`")
+    ap.add_argument("--force", action="store_true",
+                    help="For `merge`: rebuild from scratch even if a master "
+                         "already exists (Unique IDs restart at 0001).")
     args = ap.parse_args()
 
     region = args.region.upper()

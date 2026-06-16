@@ -23,7 +23,8 @@ Supporting reference files in this folder:
 - **Python is the default.** The existing v4 app is Python/Flask; reusing that ecosystem is the path of least resistance unless there's a strong reason to switch.
 - **Schema continuity is load-bearing.** The master table keeps the existing 26 Companies House columns + Unique ID + 22 Apollo columns + `Match?` + RE-flag fields. The Treasurers' final deliverable must stay shape-compatible with the current handover — they shouldn't have to learn a new file format.
 - **Apollo bulk upload caps at 10,000 rows per document.** Any batching logic has to respect this. The "batch magazine" pattern in the scope is the canonical design for this.
-- **A Gemini API key is available.** Store it in `.env` as `GEMINI_API_KEY`, never commit. Use Gemini Flash as a *second-pass disambiguation tool* inside the Y/T/N classifier and the RE flagger only — not as a general-purpose layer over the pipeline. Cascade is always: deterministic logic first → LLM only on ambiguous residual → human only on what the LLM flags low-confidence. Batch row-pairs per Gemini call to amortise overhead, require structured output (label + confidence + reason), and log every decision for audit.
+- **No LLM anywhere in the pipeline** (decision: Harry, 2026-06-11). Stage 5's second pass used to call Gemini Flash; free-tier quota stalls made it unreliable, so it was replaced by a deterministic *evidence pass* (core-name agreement ignoring middle names + nickname canonicalisation + email-corroborates-officer check, with a surname-contradiction guard on the fuzzy upgrade) in `app/stages/classifier.py`. Cascade is: deterministic fuzzy score → evidence pass on the tentative band (upgrade-only, T→Y) → human review on the no-evidence residue. Every decision still logs label + confidence + reason for audit. `GEMINI_API_KEY` is no longer used — don't reintroduce an LLM into any stage without a conversation first.
+- **Raiser's Edge data must NEVER reach an LLM** (Charles, 2026-06-10 — highly sensitive donor data). Stage 7 RE matching is deterministic formulas only, expressed as certainty tiers `Match` > `Probable` > `Potential`. The normative tier rules live in `cchq-orchestrator/references/schema_contract.md` — don't restate them elsewhere.
 
 ## House rules
 
@@ -35,4 +36,4 @@ Supporting reference files in this folder:
 
 ## Out of scope
 
-Don't build any of these without a conversation first: replacing Apollo, replacing Raiser's Edge or VoteSource, building a CRM or persistent contact database, multi-user real-time collaboration, anything that touches Step 18 (the Treasurers' actual outreach work), or wiring Gemini calls into stages outside the Y/T/N and RE disambiguation tiers. See scope §8 for the authoritative list.
+Don't build any of these without a conversation first: replacing Apollo, replacing Raiser's Edge or VoteSource, building a CRM or persistent contact database, multi-user real-time collaboration, anything that touches Step 18 (the Treasurers' actual outreach work), or wiring any LLM into any pipeline stage (the Gemini second pass was deliberately removed 2026-06-11). See scope §8 for the authoritative list.

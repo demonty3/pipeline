@@ -4,13 +4,23 @@
 {% block content %}
 <div class="page-header">
   <h1>Projects</h1>
-  <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New project</a>
+  <div>
+    <a href="{{ url_for('credit_chop_tool') }}" class="btn btn-secondary">Credit chopper</a>
+    <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New project</a>
+  </div>
 </div>
+
+{% if merge_errors %}
+<div class="alert alert-error">
+  <ul>{% for e in merge_errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
 
 {% if projects %}
 <table class="table">
   <thead>
     <tr>
+      {% if projects|length >= 2 %}<th></th>{% endif %}
       <th>Name</th>
       <th>Region</th>
       <th>Search areas</th>
@@ -24,6 +34,10 @@
   <tbody>
     {% for p in projects %}
     <tr>
+      {% if projects|length >= 2 %}
+      <td><input type="checkbox" name="merge_ids" value="{{ p.id }}"
+                 form="merge-form" title="Select for merge"></td>
+      {% endif %}
       <td><a href="{{ url_for('project_detail', project_id=p.id) }}">{{ p.name }}</a></td>
       <td><code>{{ p.region_code }}</code></td>
       <td>{{ p.postcodes | join(', ') or '—' }}</td>
@@ -41,6 +55,39 @@
     {% endfor %}
   </tbody>
 </table>
+
+{% if projects|length >= 2 %}
+<details style="margin-top:1.5rem" {% if merge_errors %}open{% endif %}>
+  <summary style="cursor:pointer;font-weight:600">Merge projects</summary>
+  <form method="POST" id="merge-form" class="form" style="margin-top:0.75rem"
+        action="{{ url_for('projects_merge') }}"
+        onsubmit="return document.querySelectorAll('input[name=merge_ids]:checked').length >= 2
+                  || (alert('Tick at least two projects to merge.'), false)">
+    <p style="color:#666;font-size:0.85rem;max-width:46rem">
+      Tick two or more projects above, then merge them into a <strong>new</strong>
+      project (the originals are kept). Rows keep their Unique IDs; the merged
+      project picks up at the deepest stage all the ticked projects have reached,
+      and the remaining stages run once over the combined list.
+    </p>
+    <div class="field">
+      <label for="merge_name">Merged project name</label>
+      <input type="text" id="merge_name" name="merge_name"
+             value="{{ merge_name or '' }}" placeholder="e.g. Richmond + Barnes June 2026" required>
+    </div>
+    <div class="field">
+      <label for="merge_region_code">Region / ID prefix</label>
+      <input type="text" id="merge_region_code" name="merge_region_code"
+             value="{{ merge_region_code or '' }}" placeholder="e.g. SWTW" maxlength="10" required>
+      <small>Used for the merged project's files. Existing rows keep their original
+        <code>#SW13-0001</code>-style IDs.</small>
+    </div>
+    <div class="field actions">
+      <button type="submit" class="btn btn-primary">Merge selected projects</button>
+    </div>
+  </form>
+</details>
+{% endif %}
+
 {% else %}
 <p class="empty">No projects yet. <a href="{{ url_for('new_project') }}">Create one.</a></p>
 {% endif %}

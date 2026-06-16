@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Credit chopper — CCHQ Pipeline{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Credit chopper</h1>
+  <a href="{{ url_for('index') }}" class="btn btn-secondary">← Projects</a>
+</div>
+
+<p class="empty" style="margin-bottom:1rem">
+  Trim any upload file so it fits your remaining Apollo credits. Apollo charges
+  one credit per name, so the file you upload can't have more names than you
+  have credits. This keeps the first <em>N</em> names (deduped) as the file to
+  send, and saves the rest to a <code>_deferred.csv</code> for next time. It also
+  respects Apollo's 10,000-rows-per-upload cap.
+</p>
+
+{% if error %}
+<div class="badge badge-error" style="display:block;padding:0.6rem 0.8rem;margin-bottom:1rem">
+  {{ error }}
+</div>
+{% endif %}
+
+<form method="POST" enctype="multipart/form-data" class="card" style="padding:1rem;max-width:640px">
+  <label style="display:block;margin-bottom:0.75rem">
+    <strong>File to chop</strong> (CSV or XLSX)<br>
+    <input type="file" name="file" accept=".csv,.xlsx,.xls" required
+           style="margin-top:0.3rem">
+  </label>
+
+  <label style="display:block;margin-bottom:0.75rem">
+    <strong>Credits available</strong><br>
+    <input type="number" name="credits" id="credits-input" min="1" step="100"
+           placeholder="leave blank to fetch from Apollo"
+           style="width:16rem;margin-top:0.3rem">
+    <button type="button" class="btn btn-secondary"
+            style="font-size:0.78rem;padding:0.25rem 0.5rem;margin-left:0.4rem"
+            onclick="fetchApolloCredits()">Fetch from Apollo</button>
+    <span id="fetch-credits-status" style="font-size:0.78rem;color:#666"></span>
+  </label>
+
+  <label style="display:block;margin-bottom:0.75rem;font-size:0.85rem"
+         title="Rows per output file. Apollo caps at 10,000 — lower it for parallel uploads.">
+    Rows per file:
+    <input type="number" name="file_cap" min="1" max="10000" step="500"
+           placeholder="10000" style="width:7rem">
+  </label>
+
+  <label style="display:block;margin-bottom:1rem;font-size:0.85rem">
+    <input type="checkbox" name="dedupe" checked>
+    Drop duplicate people first (don't pay Apollo twice for the same name)
+  </label>
+
+  <button type="submit" class="btn btn-primary">Chop file</button>
+</form>
+
+{% if result %}
+<div class="card" style="padding:1rem;max-width:640px;margin-top:1.25rem">
+  <h2 style="margin-top:0">Result for <code>{{ source_name }}</code></h2>
+  <table class="table" style="margin-bottom:1rem">
+    <tbody>
+      <tr><td>Names in file</td><td><strong>{{ "{:,}".format(result.input_rows) }}</strong></td></tr>
+      <tr><td>Duplicates dropped</td><td>{{ "{:,}".format(result.duplicates_dropped) }}</td></tr>
+      <tr><td>Credits</td><td>{{ "{:,}".format(result.credits) }}</td></tr>
+      <tr><td>To send</td><td><strong>{{ "{:,}".format(result.sent_rows) }}</strong>
+        across {{ result.send_files | length }} file(s)</td></tr>
+      <tr><td>Deferred</td><td>{{ "{:,}".format(result.deferred_rows) }}</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>Upload these to Apollo:</strong></p>
+  <ul style="list-style:none;padding:0">
+    {% for sf in result.send_files %}
+    <li style="margin-bottom:0.4rem">
+      <a class="btn btn-primary" style="font-size:0.82rem"
+         href="{{ url_for('credit_chop_download', token=token, filename=sf.filename) }}">
+        ⬇ {{ sf.filename }}</a>
+      <span style="color:#666;font-size:0.82rem">{{ "{:,}".format(sf.row_count) }} names</span>
+    </li>
+    {% endfor %}
+  </ul>
+
+  {% if result.deferred_file %}
+  <p style="margin-top:1rem"><strong>Held back for next run:</strong></p>
+  <a class="btn btn-secondary" style="font-size:0.82rem"
+     href="{{ url_for('credit_chop_download', token=token, filename=result.deferred_file) }}">
+    ⬇ {{ result.deferred_file }}</a>
+  <span style="color:#666;font-size:0.82rem">{{ "{:,}".format(result.deferred_rows) }} names</span>
+  {% endif %}
+</div>
+{% endif %}
+
+<script>
+  function fetchApolloCredits() {
+    const status = document.getElementById('fetch-credits-status');
+    status.textContent = 'fetching…';
+    fetch('{{ url_for("apollo_credits_route") }}')
+      .then(r => r.json())
+      .then(data => {
+        if (data.credits_remaining !== null && data.credits_remaining !== undefined) {
+          document.getElementById('credits-input').value = data.credits_remaining;
+          status.textContent = 'fetched: ' + data.credits_remaining.toLocaleString();
+        } else {
+          status.textContent = data.reason || 'unavailable — enter manually';
+        }
+      })
+      .catch(() => { status.textContent = 'network error — enter manually'; });
+  }
+</script>
+{% endblock %}

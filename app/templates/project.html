@@ -27,6 +27,60 @@
   </div>
 </div>
 
+{# ── Stats strip — one headline number per stage, click to jump ──────────── #}
+{% if stats.s1 or stats.s2 %}
+<div class="stats-strip">
+  <a class="stat {{ '' if stats.s1 else 'stat-empty' }}" href="#stage1-card"
+     title="Officer rows fetched from Companies House">
+    <span class="stat-label">1 · Fetched</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s1.rows) if stats.s1 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s1 %}{{ stats.s1.areas_done }}/{{ stats.s1.areas_total }} areas{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s2 else 'stat-empty' }}" href="#stage2-card"
+     title="Rows in the merged master (duplicate persons are kept but flagged)">
+    <span class="stat-label">2 · Master</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s2.rows) if stats.s2 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s2 %}{{ "{:,}".format(stats.s2.dups) }} dups flagged{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s3 else 'stat-empty' }}" href="#stage3-card"
+     title="Unique rows queued for Apollo enrichment">
+    <span class="stat-label">3 · To Apollo</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s3.rows) if stats.s3 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s3 %}{{ stats.s3.sent }}/{{ stats.s3.batches }} batches sent{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s4 else 'stat-empty' }}" href="#stage4-card"
+     title="Rows where Apollo returned a contact / a usable email address">
+    <span class="stat-label">4 · Enriched</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s4.matched) if stats.s4 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s4 %}{{ "{:,}".format(stats.s4.emails) }} emails{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s5 else 'stat-empty' }}" href="#stage5-card"
+     title="Sanity check — Apollo contact matches the officer (Y confirmed, T tentative, N no)">
+    <span class="stat-label">5 · Sanity Y+T</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s5.y + stats.s5.t) if stats.s5 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s5 %}Y&nbsp;{{ "{:,}".format(stats.s5.y) }} · T&nbsp;{{ "{:,}".format(stats.s5.t) }} · N&nbsp;{{ "{:,}".format(stats.s5.n) }}{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s6 else 'stat-empty' }}" href="#stage6-card"
+     title="Rows that came back with VoteSource data">
+    <span class="stat-label">6 · VoteSource</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s6.overlaid) if stats.s6 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s6 %}rows overlaid{% elif project.stage6_status == 'skipped' %}skipped{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if stats.s7 else 'stat-empty' }}" href="#stage7-card"
+     title="{% if stats.s7 %}Match {{ stats.s7.match }} · Probable {{ stats.s7.probable }} · Potential {{ stats.s7.potential }}{% else %}Possible existing Raiser's Edge donors{% endif %}">
+    <span class="stat-label">7 · RE flagged</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s7.flagged) if stats.s7 else "—" }}</span>
+    <span class="stat-sub">{% if stats.s7 %}M&nbsp;{{ "{:,}".format(stats.s7.match) }} · Pr&nbsp;{{ "{:,}".format(stats.s7.probable) }} · Po&nbsp;{{ "{:,}".format(stats.s7.potential) }}{% elif project.stage7_status == 'skipped' %}skipped{% endif %}</span>
+  </a>
+  <a class="stat {{ '' if (stats.s8 and files.final) else 'stat-empty' }}" href="#stage8-card"
+     title="Final deliverable — Y&T outreach list (RE-flagged rows live on the RE tab instead)">
+    <span class="stat-label">8 · Final Y&amp;T</span>
+    <span class="stat-value">{{ "{:,}".format(stats.s8.yt) if stats.s8 and files.final else "—" }}</span>
+    <span class="stat-sub">{% if stats.s8 and files.final %}ALL&nbsp;{{ "{:,}".format(stats.s8.all) }} · RE&nbsp;{{ "{:,}".format(stats.s8.re) }}{% endif %}</span>
+  </a>
+</div>
+{% endif %}
+
 {% if not has_api_key %}
 <div class="alert alert-error">
   <strong>CH_API_KEY not set.</strong> Add it to <code>app/.env</code> before fetching. You can still import an existing master below.
@@ -89,6 +143,14 @@
   {% else %}
     <button class="btn btn-primary" disabled>Running… <span id="s1-progress-text"></span></button>
   {% endif %}
+
+  <!-- Live terminal — streams the running postcode's full log during a fetch -->
+  <div id="live-terminal" class="live-terminal" style="display:none">
+    <div class="live-terminal-head">
+      <span class="live-dot"></span><span id="live-terminal-title">Fetching…</span>
+    </div>
+    <pre id="live-terminal-body" class="live-terminal-body"></pre>
+  </div>
 
   <!-- Per-area results (shown once areas have been searched) -->
   {% if project.postcodes %}
@@ -164,11 +226,11 @@
 
   {% if files.master_raw %}
   <p style="margin-top:0.75rem">
-    Master CSV ready:
     <a href="{{ url_for('download_file', project_id=project.id,
                filename='master_' + project.region_code + '_raw.csv') }}" class="dl-link">
-      master_{{ project.region_code }}_raw.csv
+      Stage 2 master — merged officers
     </a>
+    <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_raw.csv</code>
   </p>
   {% endif %}
 
@@ -221,19 +283,16 @@
       <label style="font-size:0.82rem;margin-right:0.5rem">
         <input type="checkbox" name="exclude_dissolved" value="1" checked> Exclude dissolved companies
       </label>
-      <label style="font-size:0.82rem;margin-right:0.75rem">
-        <input type="checkbox" name="exclude_non_uk" value="1" checked> Exclude non-UK officer addresses
-      </label>
       <label style="font-size:0.82rem;margin-right:0.5rem">
         Credit budget:
         <input type="number" name="credit_budget" id="credit-budget-input"
-               min="0" step="1000" placeholder="optional"
+               min="0" step="1" placeholder="optional"
                style="width:7rem;font-size:0.82rem;padding:0.15rem 0.3rem">
       </label>
       <label style="font-size:0.82rem;margin-right:0.5rem" title="Rows per batch file. Apollo caps at 10,000 — pick lower for parallel uploads.">
         Batch size:
         <input type="number" name="batch_size"
-               min="1" max="10000" step="500" placeholder="10000"
+               min="1" max="10000" step="1" placeholder="10000"
                style="width:6rem;font-size:0.82rem;padding:0.15rem 0.3rem">
       </label>
       <button type="button" class="btn btn-secondary" id="fetch-credits-btn"
@@ -258,6 +317,25 @@
           })
           .catch(() => { status.textContent = 'network error — enter manually'; });
       }
+
+      function markBatchSent(btn) {
+        btn.disabled = true;
+        const fd = new FormData();
+        fd.append('batch_id', btn.dataset.batchId);
+        fetch('{{ url_for("stage3_mark_sent", project_id=project.id) }}',
+              { method: 'POST', body: fd, headers: { 'Accept': 'application/json' } })
+          .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+          .then(() => {
+            const badge = btn.closest('tr').querySelector('.badge');
+            badge.textContent = 'sent';
+            badge.className = 'badge badge-sent';
+            btn.outerHTML = '<span style="color:#888;font-size:0.82rem">sent</span>';
+          })
+          .catch(() => {
+            btn.disabled = false;
+            alert('Could not mark batch as sent — try again.');
+          });
+      }
     </script>
   {% else %}
     <button class="btn btn-primary" disabled title="Complete Stage 2 first">Build batches</button>
@@ -280,13 +358,11 @@
         </td>
         <td>
           {% if b.status == 'pending' %}
-          <form method="POST" action="{{ url_for('stage3_mark_sent', project_id=project.id) }}"
-                style="display:inline">
-            <input type="hidden" name="batch_id" value="{{ b.id }}">
-            <button type="submit" class="btn btn-secondary" style="font-size:0.78rem;padding:0.25rem 0.6rem">
-              Mark sent
-            </button>
-          </form>
+          <button type="button" class="btn btn-secondary" data-batch-id="{{ b.id }}"
+                  style="font-size:0.78rem;padding:0.25rem 0.6rem"
+                  onclick="markBatchSent(this)">
+            Mark sent
+          </button>
           {% else %}
           <span style="color:#888;font-size:0.82rem">{{ b.status }}</span>
           {% endif %}
@@ -377,8 +453,9 @@
     <p style="margin-top:0.75rem">
       <a href="{{ url_for('download_file', project_id=project.id,
                  filename='master_' + project.region_code + '_enriched.csv') }}" class="dl-link">
-        Download enriched master
+        Stage 4 master — Apollo-enriched
       </a>
+      <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_enriched.csv</code>
     </p>
     {% endif %}
 
@@ -423,55 +500,24 @@
   </div>
 
   <p>
-    Three-pass cascade: deterministic name similarity → Gemini Flash disambiguation → human review.
+    Three-pass cascade: deterministic name similarity → evidence pass (nicknames + email corroboration) → human review.
     Adds a <code>Result</code> column (Y/T/N) to the master.
-    {% if not has_gemini %}
-    <span style="color:#92400e">⚠ GEMINI_API_KEY not set — Tentative rows will go straight to human review.</span>
-    {% endif %}
   </p>
 
   {% if project.stage4_status == 'complete' %}
     {% if project.stage5_status in ('pending', 'error') %}
-      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}"
-            style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">
+      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}">
         <button type="submit" class="btn btn-primary">Run classifier</button>
-        <label class="inline-check" title="Untick if you know Gemini is out of credits or unavailable">
-          <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
-          Use Gemini for Pass 2
-        </label>
       </form>
     {% elif project.stage5_status == 'running' %}
       <button class="btn btn-primary" disabled>Running… <span id="s5-progress"></span></button>
-    {% elif project.stage5_status == 'gemini_unavailable' %}
-      <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;margin-bottom:0.75rem">
-        <strong>Gemini unavailable.</strong>
-        {% if job and job.stage == 5 and job.detail %}
-        {{ job.progress }} — <code style="font-size:0.78rem">{{ job.detail }}</code>
-        {% else %}
-        Pass 2 was aborted because Gemini failed repeatedly. Retry once credits return, or continue manually (every Tentative row goes to human review).
-        {% endif %}
-      </div>
-      <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
-        <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}" style="display:inline">
-          <input type="hidden" name="use_gemini" value="1">
-          <button type="submit" class="btn btn-primary">Retry with Gemini</button>
-        </form>
-        <form method="POST" action="{{ url_for('stage5_continue_manually', project_id=project.id) }}" style="display:inline">
-          <button type="submit" class="btn btn-secondary">Continue without Gemini</button>
-        </form>
-      </div>
     {% elif project.stage5_status == 'review_needed' %}
       <a href="{{ url_for('stage5_review', project_id=project.id) }}" class="btn btn-primary">
         Review {{ s5_review_count }} row{{ 's' if s5_review_count != 1 }}
       </a>
     {% elif project.stage5_status == 'complete' %}
-      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}"
-            style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">
+      <form method="POST" action="{{ url_for('stage5_run', project_id=project.id) }}">
         <button type="submit" class="btn btn-secondary">Re-run classifier</button>
-        <label class="inline-check">
-          <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
-          Use Gemini for Pass 2
-        </label>
       </form>
     {% endif %}
   {% else %}
@@ -482,8 +528,9 @@
   <p style="margin-top:0.75rem">
     <a href="{{ url_for('download_file', project_id=project.id,
                filename='master_' + project.region_code + '_classified.csv') }}" class="dl-link">
-      Download classified master
+      Stage 5 master — Y/T/N classified
     </a>
+    <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_classified.csv</code>
     {% if files.class_log %}
     &nbsp;·&nbsp;
     <a href="{{ url_for('download_file', project_id=project.id, filename='classifications_log.csv') }}"
@@ -534,7 +581,7 @@
         {% endif %}
         <a href="{{ url_for('download_file', project_id=project.id,
                    filename='vs_export_' + project.region_code + '.csv') }}"
-           class="dl-link" style="margin-left:0.5rem">Download VS export</a>
+           class="dl-link" style="margin-left:0.5rem">Stage 6 upload — for VoteSource</a>
       </div>
       <form method="POST" action="{{ url_for('stage6_upload_return', project_id=project.id) }}"
             enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
@@ -551,8 +598,9 @@
       {% if files.master_vs %}
       <a href="{{ url_for('download_file', project_id=project.id,
                  filename='master_' + project.region_code + '_vs.csv') }}" class="dl-link">
-        Download VS master
+        Stage 6 master — VoteSource overlay
       </a>
+      <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_vs.csv</code>
       {% endif %}
     {% elif project.stage6_status == 'skipped' %}
       <p style="color:#3730a3">Stage skipped — proceeding without VoteSource overlay.</p>
@@ -582,27 +630,26 @@
   </div>
 
   <p>
-    Upload the RE export (XLSX or ODS) to fuzzy-match constituent names against the master.
-    Adds <code>RE Match?</code>, <code>Potential</code>, and <code>Match?</code> columns.
+    Upload the RE export (XLSX or ODS) to match constituents against the master — formulas only,
+    no LLM (sensitive donor data). Each hit gets a certainty tier in <code>Potential</code>
+    (<strong>Match</strong> &gt; <strong>Probable</strong> &gt; <strong>Potential</strong> —
+    the rules live in <code>schema_contract.md</code>).
     Skip if no RE cross-reference is needed.
-    {% if not has_gemini %}
-    <span style="color:#92400e">⚠ GEMINI_API_KEY not set — medium-confidence matches go straight to human review.</span>
-    {% endif %}
   </p>
 
   {% set s6_done = project.stage6_status in ('complete', 'skipped') %}
   {% if project.stage5_status == 'complete' and s6_done %}
-    {% if project.stage7_status in ('pending', 'error') %}
+    {% if project.stage7_status in ('pending', 'error', 'paused') %}
+      {% if project.stage7_status == 'paused' %}
+      <p style="color:#92400e">Run paused before completion — nothing was saved.
+        Re-upload the RE export to run again from the start.</p>
+      {% endif %}
       <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
         <form method="POST" action="{{ url_for('stage7_upload_re', project_id=project.id) }}"
               enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
           <input type="file" name="file" accept=".xlsx,.ods" required
                  style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
           <button type="submit" class="btn btn-primary">Upload RE export &amp; run</button>
-          <label class="inline-check" title="Untick if you know Gemini is out of credits or unavailable">
-            <input type="checkbox" name="use_gemini" value="1" {% if has_gemini %}checked{% endif %}>
-            Use Gemini for Pass 2
-          </label>
         </form>
         <form method="POST" action="{{ url_for('stage7_skip', project_id=project.id) }}" style="display:inline">
           <button type="submit" class="btn btn-secondary">Skip RE cross-reference</button>
@@ -610,39 +657,15 @@
       </div>
     {% elif project.stage7_status == 'running' %}
       <button class="btn btn-primary" disabled>Running… <span id="s7-progress"></span></button>
-    {% elif project.stage7_status == 'gemini_unavailable' %}
-      <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;margin-bottom:0.75rem">
-        <strong>Gemini unavailable.</strong>
-        {% if job and job.stage == 7 and job.detail %}
-        {{ job.progress }} — <code style="font-size:0.78rem">{{ job.detail }}</code>
-        {% else %}
-        Pass 2 was aborted because Gemini failed repeatedly. Retry once credits return, or continue manually (every medium-confidence match goes to human review).
-        {% endif %}
-      </div>
-      <div class="actions" style="flex-wrap:wrap;gap:0.5rem">
-        <form method="POST" action="{{ url_for('stage7_continue_manually', project_id=project.id) }}" style="display:inline">
-          <button type="submit" class="btn btn-secondary">Continue without Gemini</button>
-        </form>
-        <form method="POST" action="{{ url_for('stage7_upload_re', project_id=project.id) }}"
-              enctype="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
-          <input type="file" name="file" accept=".xlsx,.ods" required
-                 style="font-size:0.82rem;border:1px solid #ccc;border-radius:4px;padding:0.3rem 0.5rem">
-          <input type="hidden" name="use_gemini" value="1">
-          <button type="submit" class="btn btn-primary">Retry with Gemini (re-upload RE)</button>
-        </form>
-      </div>
-    {% elif project.stage7_status == 'review_needed' %}
-      <a href="{{ url_for('stage7_review', project_id=project.id) }}" class="btn btn-primary">
-        Review {{ s7_review_count }} match{{ 'es' if s7_review_count != 1 }}
-      </a>
     {% elif project.stage7_status in ('complete', 'skipped') %}
       {% if project.stage7_status == 'complete' %}
         <p style="color:#065f46;font-weight:600">RE flagging complete.</p>
         {% if files.master_re %}
         <a href="{{ url_for('download_file', project_id=project.id,
                    filename='master_' + project.region_code + '_re_flagged.csv') }}" class="dl-link">
-          Download RE-flagged master
+          Stage 7 master — RE-flagged
         </a>
+        <code style="color:#999;font-size:0.75rem">master_{{ project.region_code }}_re_flagged.csv</code>
         {% endif %}
       {% else %}
         <p style="color:#3730a3">Stage skipped — no RE cross-reference.</p>
@@ -697,8 +720,9 @@
   <p style="margin-top:0.75rem">
     <a href="{{ url_for('download_file', project_id=project.id,
                filename=project.region_code + '_final_deliverable.xlsx') }}" class="dl-link">
-      Download {{ project.region_code }}_final_deliverable.xlsx
+      Stage 8 — final deliverable (XLSX)
     </a>
+    <code style="color:#999;font-size:0.75rem">{{ project.region_code }}_final_deliverable.xlsx</code>
   </p>
   {% endif %}
 
@@ -850,6 +874,32 @@ function pollStatus() {
           if (rowsEl) rowsEl.textContent = info.rows > 0 ? info.rows.toLocaleString() : '—';
           if (logEl && info.log && info.log.length > 0) {
             logEl.textContent = info.log[info.log.length - 1];
+          }
+        }
+
+        // ── Live terminal: stream the running postcode's full log ──────────
+        const term  = document.getElementById('live-terminal');
+        const tbody = document.getElementById('live-terminal-body');
+        const ttl   = document.getElementById('live-terminal-title');
+        if (term && tbody) {
+          // Prefer the postcode currently running; else the last with output.
+          let active = null;
+          for (const [pc, info] of Object.entries(job.postcodes)) {
+            if (info.status === 'running') { active = [pc, info]; break; }
+            if (info.log && info.log.length) active = [pc, info];
+          }
+          if (active) {
+            const [pc, info] = active;
+            term.style.display = 'block';
+            ttl.textContent = `${pc} — ${info.status}`;
+            // Cap the rendered tail so very long fetches stay snappy.
+            const txt = (info.log || []).slice(-400).join('\n');
+            if (tbody.textContent !== txt) {
+              const atBottom =
+                tbody.scrollHeight - tbody.scrollTop - tbody.clientHeight < 30;
+              tbody.textContent = txt;
+              if (atBottom) tbody.scrollTop = tbody.scrollHeight;
+            }
           }
         }
       }

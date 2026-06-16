@@ -9,9 +9,11 @@ import re
 import shutil
 import threading
 import tempfile
+import uuid
 import pandas as pd
 from flask import (Flask, render_template, request, redirect, url_for,
                    jsonify, send_file, abort)
+from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
 import database as db
@@ -20,14 +22,14 @@ from stages.merge import run_merge, backfill_unique_ids, count_missing_unique_id
 from stages.apollo_magazine import build_batches
 from stages.apollo_ingest import ingest_batch, ingest_multiple
 from stages.classifier import (run_passes_1_and_2, apply_decisions_and_save,
-                                retry_gemini_failed_rows as classifier_retry,
                                 count_apollo_placeholders_in_queue,
                                 reclassify_apollo_placeholders)
-from stages.re_flagger import (run_re_flagging, apply_re_decisions_and_save,
-                                retry_gemini_failed_rows as re_flagger_retry)
-from stages import gemini_health
+from stages.re_flagger import run_re_flagging, apply_re_decisions_and_save
 from stages.exporter import build_export
+from stats import project_stats
+from stages.project_merge import merge_projects
 from stages.vs_export import build_vs_export
+from stages.credit_chop import chop_for_credits
 
 load_dotenv()
 
@@ -35,7 +37,6 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-key-change-me")
 
 CH_API_KEY     = os.getenv("CH_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── In-memory job state ───────────────────────────────────────────────────────
 _job_state: dict = {}
@@ -43,6 +44,11 @@ _job_lock = threading.Lock()
 
 # Per-project cancel events — set to signal a running background thread to stop.
 _cancel_events: dict = {}  # project_id → threading.Event
+
+# Credit-chopper output dirs, keyed by a one-time token so the results page can
+# offer the trimmed files for download. Lives only for the app's lifetime.
+_chop_outputs: dict = {}  # token → temp out_dir
+_chop_lock = threading.Lock()
 
 def _job(pid):
     with _job_lock:
@@ -125,10 +131,53 @@ def new_project():
         project_id = db.create_project(name, region_code, event_date, [])
         pdir = db.project_dir(project_id, region_code)
         os.makedirs(os.path.join(pdir, "postcodes"), exist_ok=True)
+        write_file_guide(pdir, region_code)
         return redirect(url_for("project_detail", project_id=project_id))
 
     return render_template("new_project.html", errors=[], name="", region_code="",
                            event_date="")
+
+
+@app.route("/projects/merge", methods=["POST"])
+def projects_merge():
+    """Merge ≥2 projects into a NEW project (sources untouched). Synchronous —
+    it's a few CSV concats, same weight as a Stage 8 export."""
+    ids = request.form.getlist("merge_ids", type=int)
+    name = request.form.get("merge_name", "").strip()
+    region_code = request.form.get("merge_region_code", "").strip().upper()
+
+    errors = []
+    if len(ids) < 2:
+        errors.append("Tick at least two projects to merge.")
+    if not name:
+        errors.append("The merged project needs a name.")
+    if not re.fullmatch(r"[A-Z0-9]{1,10}", region_code or ""):
+        errors.append("Region/ID prefix must be 1-10 letters or digits (e.g. SWTW).")
+
+    sources = []
+    for pid in ids:
+        p = db.get_project(pid)
+        if not p:
+            errors.append(f"Project {pid} no longer exists.")
+            continue
+        job = _job(pid)
+        if job and job.get("status") == "running":
+            errors.append(f"'{p['name']}' has a stage running — wait for it to finish.")
+        sources.append((p, db.project_dir(pid, p["region_code"])))
+
+    if not errors:
+        try:
+            result = merge_projects(sources, db, name, region_code)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if errors:
+        return render_template("index.html", projects=db.get_all_projects(),
+                               merge_errors=errors, merge_name=name,
+                               merge_region_code=region_code)
+
+    write_file_guide(result["project_dir"], region_code)
+    return redirect(url_for("project_detail", project_id=result["project_id"]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -176,10 +225,9 @@ def project_detail(project_id):
         batches_ingested=ingested,
         files=files,
         has_api_key=bool(CH_API_KEY),
-        has_gemini=bool(GEMINI_API_KEY),
         s5_review_count=len(db.get_s5_review_queue(project_id)),
-        s7_review_count=len(db.get_s7_review_queue(project_id)),
         missing_uids=count_missing_unique_ids(pdir, rc),
+        stats=project_stats(project, pdir, batches),
     )
 
 
@@ -243,6 +291,75 @@ def delete_project(project_id):
 # File download
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Map the canonical on-disk names to stage-numbered names for the browser's
+# save dialog, so a non-technical operator can tell which stage a downloaded
+# file came from. On-disk names are unchanged — this renames at the edge only.
+_FRIENDLY_PATTERNS = [
+    (r"^results_(.+)\.csv$",          "{rc} — Stage 1 — Companies House {m1}.csv"),
+    (r"^master_.+_raw\.csv$",         "{rc} — Stage 2 — merged officers master.csv"),
+    (r"^apollo_batch_(\d+)\.csv$",    "{rc} — Stage 3 — Apollo upload batch {m1}.csv"),
+    (r"^master_.+_enriched\.csv$",    "{rc} — Stage 4 — Apollo enriched master.csv"),
+    (r"^master_.+_classified\.csv$",  "{rc} — Stage 5 — YTN classified master.csv"),
+    (r"^classifications_log\.csv$",   "{rc} — Stage 5 — audit log.csv"),
+    (r"^vs_export_.+\.(csv|xlsx)$",   "{rc} — Stage 6 — for VoteSource.{m1}"),
+    (r"^master_.+_vs\.csv$",          "{rc} — Stage 6 — VoteSource master.csv"),
+    (r"^master_.+_re_flagged\.csv$",  "{rc} — Stage 7 — RE flagged master.csv"),
+    (r"^.+_final_deliverable\.xlsx$", "{rc} — Stage 8 — final deliverable.xlsx"),
+]
+
+
+def write_file_guide(project_dir, region_code):
+    """
+    Drop a plain-text WHAT_IS_WHAT.txt into the project folder so anyone
+    browsing it (Drive sync, Finder) can tell which stage each file belongs
+    to — the on-disk names themselves are load-bearing and stay unchanged.
+    """
+    rc = region_code
+    guide = f"""WHAT IS WHAT — {rc} project folder
+=================================================
+
+Each pipeline stage writes its own file; nothing is overwritten. A file
+listed below appears once its stage has run.
+
+  postcodes/results_<POSTCODE>.csv   Stage 1 — raw Companies House search,
+                                     one file per postcode area
+  master_{rc}_raw.csv                Stage 2 — all postcodes merged, Unique IDs
+                                     assigned (the spine of everything below)
+  apollo_batch_NNN.csv               Stage 3 — upload these to Apollo (max
+                                     10,000 rows each)
+  master_{rc}_enriched.csv           Stage 4 — Apollo contact data joined on
+  master_{rc}_classified.csv         Stage 5 — sanity check added (Result =
+                                     Y/T/N: is the Apollo contact really this
+                                     director?)
+  classifications_log.csv            Stage 5 — audit trail of every decision
+  vs_export_{rc}.xlsx                Stage 6 — send this to VoteSource
+  master_{rc}_vs.csv                 Stage 6 — VoteSource's return folded in
+  re_export_{rc}.csv                 Stage 7 input — the Raiser's Edge
+                                     constituent list (sensitive — never
+                                     leaves this folder)
+  master_{rc}_re_flagged.csv         Stage 7 — RE match tiers added
+                                     (Match > Probable > Potential)
+  {rc}_final_deliverable.xlsx        Stage 8 — THE HANDOVER FILE (tabs: ALL,
+                                     Y&T, Potential RE Match)
+
+Rule of thumb: the highest-numbered master file is the most complete one.
+Stage 8 always exports from the most complete master that exists.
+"""
+    with open(os.path.join(project_dir, "WHAT_IS_WHAT.txt"), "w") as fh:
+        fh.write(guide)
+
+
+def _friendly_name(filename, region_code):
+    """Stage-numbered download name for a known pipeline file, else unchanged."""
+    base = os.path.basename(filename)
+    for pattern, template in _FRIENDLY_PATTERNS:
+        m = re.match(pattern, base)
+        if m:
+            return template.format(rc=region_code,
+                                   m1=m.group(1) if m.groups() else "")
+    return base
+
+
 @app.route("/project/<int:project_id>/download/<path:filename>")
 def download_file(project_id, filename):
     project = db.get_project(project_id)
@@ -252,7 +369,8 @@ def download_file(project_id, filename):
     full_path = _safe_path(pdir, filename)
     if not os.path.exists(full_path):
         abort(404)
-    return send_file(full_path, as_attachment=True)
+    return send_file(full_path, as_attachment=True,
+                     download_name=_friendly_name(filename, project["region_code"]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -524,8 +642,8 @@ def stage3_build(project_id):
 
     pdir = db.project_dir(project_id, project["region_code"])
     rc = project["region_code"]
-    exclude_dissolved = request.form.get("exclude_dissolved") == "on"
-    exclude_non_uk = request.form.get("exclude_non_uk") == "on"
+    # Checkbox sends its `value` attr ("1"), not "on" — accept any non-empty value.
+    exclude_dissolved = bool(request.form.get("exclude_dissolved"))
     # Optional credit budget. Operator types it in, or pre-fills via /apollo/credits.
     # Empty or zero means "no cap".
     credit_budget = request.form.get("credit_budget", type=int)
@@ -543,7 +661,6 @@ def stage3_build(project_id):
             db.add_log(project_id, 3, msg)
 
         batches = build_batches(pdir, rc, exclude_dissolved=exclude_dissolved,
-                                exclude_non_uk=exclude_non_uk,
                                 credit_budget=credit_budget,
                                 batch_size=batch_size, progress_cb=cb)
         for b in batches:
@@ -577,12 +694,76 @@ def apollo_credits_route():
     return jsonify({"credits_remaining": credits})
 
 
+# ── Credit chopper (standalone operator tool) ─────────────────────────────────
+
+@app.route("/tools/credit-chop", methods=["GET", "POST"])
+def credit_chop_tool():
+    """
+    Standalone helper: upload any CSV/XLSX + a credit count, get back a file
+    trimmed to fit (never more names than credits, never over Apollo's 10k/file
+    cap) plus the deferred leftover. Not tied to a project — file in, files out.
+    """
+    if request.method == "GET":
+        return render_template("credit_chop.html", result=None, error=None)
+
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return render_template("credit_chop.html", result=None,
+                               error="Choose a CSV or XLSX file to chop.")
+
+    credits = request.form.get("credits", type=int)  # blank → auto-fetch
+    file_cap = request.form.get("file_cap", type=int) or 10_000
+    dedupe = request.form.get("dedupe") == "on"
+
+    # Save the upload under its real name so output files keep a sensible stem.
+    in_dir = tempfile.mkdtemp(prefix="chop_in_")
+    in_path = os.path.join(in_dir, secure_filename(f.filename) or "upload.csv")
+    f.save(in_path)
+    out_dir = tempfile.mkdtemp(prefix="chop_out_")
+
+    try:
+        result = chop_for_credits(in_path, credits=credits, out_dir=out_dir,
+                                  file_cap=file_cap, dedupe=dedupe)
+    except Exception as exc:
+        shutil.rmtree(in_dir, ignore_errors=True)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return render_template("credit_chop.html", result=None, error=str(exc))
+    finally:
+        shutil.rmtree(in_dir, ignore_errors=True)
+
+    token = uuid.uuid4().hex
+    with _chop_lock:
+        _chop_outputs[token] = out_dir
+        # Bound the cache so chopper temp dirs don't accumulate for the app's
+        # whole lifetime — evict and delete the oldest beyond the most recent 20.
+        while len(_chop_outputs) > 20:
+            old_token = next(iter(_chop_outputs))
+            shutil.rmtree(_chop_outputs.pop(old_token), ignore_errors=True)
+
+    return render_template("credit_chop.html", result=result, token=token,
+                           source_name=f.filename, error=None)
+
+
+@app.route("/tools/credit-chop/download/<token>/<path:filename>")
+def credit_chop_download(token, filename):
+    with _chop_lock:
+        out_dir = _chop_outputs.get(token)
+    if not out_dir:
+        abort(404)
+    full = os.path.abspath(os.path.join(out_dir, filename))
+    if not full.startswith(os.path.abspath(out_dir)) or not os.path.exists(full):
+        abort(404)
+    return send_file(full, as_attachment=True)
+
+
 @app.route("/project/<int:project_id>/stage3/mark-sent", methods=["POST"])
 def stage3_mark_sent(project_id):
     batch_id = request.form.get("batch_id", type=int)
     if not batch_id:
         abort(400)
     db.update_batch_status(batch_id, "sent")
+    if request.headers.get("Accept") == "application/json":
+        return jsonify(ok=True)
     return redirect(url_for("project_detail", project_id=project_id))
 
 
@@ -770,57 +951,31 @@ def stage5_run(project_id):
     if job and job.get("stage") == 5 and job.get("status") == "running":
         return jsonify({"error": "Classifier already running"}), 409
 
-    # Form flag: ticked by default in the template. Operator unticks when they
-    # already know Gemini is unavailable and want to go straight to manual.
-    use_gemini = request.form.get("use_gemini") == "1"
-
     pdir = db.project_dir(project_id, project["region_code"])
     rc = project["region_code"]
-
-    # If the operator wants Gemini, ping it first so we fail fast on bad-key /
-    # quota-exhausted / network. The probe is cheap (one trivial generate call).
-    if use_gemini:
-        status, details = gemini_health.ping(GEMINI_API_KEY)
-        if status != "ok":
-            db.update_stage5_status(project_id, "gemini_unavailable")
-            db.add_log(project_id, 5, f"Pre-flight: {gemini_health.human(status)} — {details}")
-            _set_job(project_id, {"stage": 5, "status": "gemini_unavailable",
-                                  "progress": gemini_health.human(status),
-                                  "detail": details})
-            return redirect(url_for("project_detail", project_id=project_id))
 
     _set_job(project_id, {"stage": 5, "status": "running", "progress": "Starting…"})
     db.update_stage5_status(project_id, "running")
     ev = threading.Event()
     _cancel_events[project_id] = ev
-    api_key = GEMINI_API_KEY if use_gemini else ""
-    threading.Thread(target=_run_classifier, args=(project_id, pdir, rc, ev, api_key),
+    threading.Thread(target=_run_classifier, args=(project_id, pdir, rc, ev),
                      daemon=True).start()
     return redirect(url_for("project_detail", project_id=project_id))
 
 
-def _run_classifier(project_id, pdir, rc, cancel_event, gemini_api_key):
+def _run_classifier(project_id, pdir, rc, cancel_event):
     def cb(msg):
         db.add_log(project_id, 5, msg)
         _update_job(project_id, progress=msg)
 
     try:
-        summary = run_passes_1_and_2(project_id, pdir, rc, gemini_api_key,
-                                     progress_cb=cb, db=db, cancel_event=cancel_event)
+        run_passes_1_and_2(project_id, pdir, rc,
+                           progress_cb=cb, db=db, cancel_event=cancel_event)
         _cancel_events.pop(project_id, None)
         if cancel_event.is_set():
             db.update_stage5_status(project_id, "paused")
             db.add_log(project_id, 5, "Classifier paused")
             _update_job(project_id, status="paused")
-            return
-
-        # Gemini died mid-run (3 consecutive batch errors). Don't transition to
-        # review_needed — the operator might want to retry once credits are back.
-        if summary.get("aborted_gemini"):
-            db.update_stage5_status(project_id, "gemini_unavailable")
-            db.add_log(project_id, 5, "Gemini aborted mid-run — choose Retry or Continue manually")
-            _update_job(project_id, status="gemini_unavailable",
-                        progress="Gemini aborted — choose Retry or Continue manually")
             return
 
         review_count = len(db.get_s5_review_queue(project_id))
@@ -839,90 +994,6 @@ def _run_classifier(project_id, pdir, rc, cancel_event, gemini_api_key):
         db.update_stage5_status(project_id, "error")
         db.add_log(project_id, 5, f"ERROR: {exc}")
         _update_job(project_id, status="error", progress=str(exc))
-
-
-@app.route("/project/<int:project_id>/stage5/continue-manually", methods=["POST"])
-def stage5_continue_manually(project_id):
-    """
-    Operator chose 'Continue without Gemini' on the gemini_unavailable screen.
-    Re-runs Pass 1+2 with an empty key, which routes every Tentative row to
-    the manual review queue.
-    """
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-
-    pdir = db.project_dir(project_id, project["region_code"])
-    rc = project["region_code"]
-    _set_job(project_id, {"stage": 5, "status": "running",
-                          "progress": "Manual mode — skipping Gemini…"})
-    db.update_stage5_status(project_id, "running")
-    ev = threading.Event()
-    _cancel_events[project_id] = ev
-    threading.Thread(target=_run_classifier, args=(project_id, pdir, rc, ev, ""),
-                     daemon=True).start()
-    return redirect(url_for("project_detail", project_id=project_id))
-
-
-@app.route("/project/<int:project_id>/stage5/retry-gemini", methods=["POST"])
-def stage5_retry_gemini(project_id):
-    """Re-run Pass 2 only on rows that errored or were never tried."""
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-
-    job = _job(project_id)
-    if job and job.get("stage") == 5 and job.get("status") == "running":
-        return jsonify({"error": "Classifier already running"}), 409
-
-    status, details = gemini_health.ping(GEMINI_API_KEY)
-    if status != "ok":
-        db.update_stage5_status(project_id, "gemini_unavailable")
-        db.add_log(project_id, 5, f"Retry pre-flight failed: {gemini_health.human(status)} — {details}")
-        _set_job(project_id, {"stage": 5, "status": "gemini_unavailable",
-                              "progress": gemini_health.human(status),
-                              "detail": details})
-        return redirect(url_for("project_detail", project_id=project_id))
-
-    pdir = db.project_dir(project_id, project["region_code"])
-    rc = project["region_code"]
-    _set_job(project_id, {"stage": 5, "status": "running", "progress": "Retrying Gemini…"})
-    db.update_stage5_status(project_id, "running")
-    ev = threading.Event()
-    _cancel_events[project_id] = ev
-
-    def worker():
-        def cb(msg):
-            db.add_log(project_id, 5, msg)
-            _update_job(project_id, progress=msg)
-        try:
-            summary = classifier_retry(project_id, pdir, rc, GEMINI_API_KEY,
-                                       db=db, progress_cb=cb, cancel_event=ev)
-            _cancel_events.pop(project_id, None)
-            if summary.get("aborted_gemini"):
-                db.update_stage5_status(project_id, "gemini_unavailable")
-                db.add_log(project_id, 5, "Retry hit consecutive Gemini errors again")
-                _update_job(project_id, status="gemini_unavailable",
-                            progress="Gemini still failing")
-                return
-            review_count = len(db.get_s5_review_queue(project_id))
-            if review_count > 0:
-                db.update_stage5_status(project_id, "review_needed")
-                _update_job(project_id, status="review_needed",
-                            progress=f"{review_count:,} rows still in review")
-            else:
-                rows = apply_decisions_and_save(project_id, pdir, rc, db)
-                db.update_stage5_status(project_id, "complete")
-                db.add_log(project_id, 5, f"Stage 5 complete after retry — {rows:,} rows classified")
-                _update_job(project_id, status="done")
-        except Exception as exc:
-            _cancel_events.pop(project_id, None)
-            db.update_stage5_status(project_id, "error")
-            db.add_log(project_id, 5, f"Retry ERROR: {exc}")
-            _update_job(project_id, status="error", progress=str(exc))
-
-    threading.Thread(target=worker, daemon=True).start()
-    return redirect(url_for("project_detail", project_id=project_id))
 
 
 @app.route("/project/<int:project_id>/stage5/review")
@@ -948,31 +1019,16 @@ def stage5_review(project_id):
                 "apollo_last":  row.get("Apollo Last Name", ""),
             }
 
-    # The Pass-1 Tentative score is the most useful signal when Gemini didn't
-    # give an opinion. Tag each row with where its context came from so the
-    # operator can power through manual-mode queues faster.
+    # The Pass-1 fuzzy score is the operator's best at-a-glance signal for
+    # rows the deterministic passes couldn't settle.
     pass1_scores = db.get_s5_pass1_scores(project_id)
-    failed_count = 0
-    gemini_count = 0
     for item in queue:
         info = name_lookup.get(item["unique_id"], {})
         item["officer_name"] = info.get("officer_name", "")
         item["company_name"] = info.get("company_name", "")
         item["apollo_first"] = info.get("apollo_first", "")
         item["apollo_last"]  = info.get("apollo_last", "")
-
         item["fuzzy_score"] = pass1_scores.get(item["unique_id"])
-
-        reason = item.get("reason") or ""
-        if reason.startswith("Gemini error"):
-            item["source"] = "Gemini error"
-            failed_count += 1
-        elif reason.startswith("Gemini not configured"):
-            item["source"] = "No Gemini"
-            failed_count += 1
-        else:
-            item["source"] = "Gemini low-conf"
-            gemini_count += 1
 
     # Highest-similarity Tentatives first — fastest to confirm by eye.
     queue.sort(key=lambda r: (r.get("fuzzy_score") or 0), reverse=True)
@@ -982,7 +1038,6 @@ def stage5_review(project_id):
     placeholder_count = count_apollo_placeholders_in_queue(project_id, pdir, rc, db)
 
     return render_template("stage5_review.html", project=project, queue=queue,
-                           failed_count=failed_count, gemini_count=gemini_count,
                            placeholder_count=placeholder_count)
 
 
@@ -1070,7 +1125,7 @@ def stage6_export_vs(project_id):
     return send_file(
         out_path,
         as_attachment=True,
-        download_name=f"vs_export_{rc}.xlsx",
+        download_name=_friendly_name(f"vs_export_{rc}.xlsx", rc),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -1148,6 +1203,12 @@ def stage7_upload_re(project_id):
     if "file" not in request.files or not request.files["file"].filename:
         return jsonify({"error": "No file uploaded"}), 400
 
+    job = _job(project_id)
+    if job and job.get("stage") == 7 and job.get("status") == "running":
+        # Reject BEFORE saving — otherwise the rejected upload would still
+        # overwrite the export the in-flight run was computed from.
+        return jsonify({"error": "RE matching already running"}), 409
+
     f = request.files["file"]
     pdir = db.project_dir(project_id, project["region_code"])
     rc = project["region_code"]
@@ -1155,40 +1216,23 @@ def stage7_upload_re(project_id):
     re_path = os.path.join(pdir, f"re_export_{rc}{os.path.splitext(f.filename)[1]}")
     f.save(re_path)
 
-    job = _job(project_id)
-    if job and job.get("stage") == 7 and job.get("status") == "running":
-        return jsonify({"error": "RE matching already running"}), 409
-
-    use_gemini = request.form.get("use_gemini") == "1"
-
-    if use_gemini:
-        status, details = gemini_health.ping(GEMINI_API_KEY)
-        if status != "ok":
-            db.update_stage7_status(project_id, "gemini_unavailable")
-            db.add_log(project_id, 7, f"Pre-flight: {gemini_health.human(status)} — {details}")
-            _set_job(project_id, {"stage": 7, "status": "gemini_unavailable",
-                                  "progress": gemini_health.human(status),
-                                  "detail": details, "re_path": re_path})
-            return redirect(url_for("project_detail", project_id=project_id))
-
     _set_job(project_id, {"stage": 7, "status": "running",
-                          "progress": "Starting RE match…", "re_path": re_path})
+                          "progress": "Starting RE match…"})
     db.update_stage7_status(project_id, "running")
     ev = threading.Event()
     _cancel_events[project_id] = ev
-    api_key = GEMINI_API_KEY if use_gemini else ""
     threading.Thread(target=_run_re_flagger,
-                     args=(project_id, pdir, rc, re_path, ev, api_key), daemon=True).start()
+                     args=(project_id, pdir, rc, re_path, ev), daemon=True).start()
     return redirect(url_for("project_detail", project_id=project_id))
 
 
-def _run_re_flagger(project_id, pdir, rc, re_path, cancel_event, gemini_api_key):
+def _run_re_flagger(project_id, pdir, rc, re_path, cancel_event):
     def cb(msg):
         db.add_log(project_id, 7, msg)
         _update_job(project_id, progress=msg)
 
     try:
-        summary = run_re_flagging(project_id, pdir, rc, re_path, gemini_api_key,
+        summary = run_re_flagging(project_id, pdir, rc, re_path,
                                   progress_cb=cb, db=db, cancel_event=cancel_event)
         _cancel_events.pop(project_id, None)
         if cancel_event.is_set():
@@ -1197,187 +1241,18 @@ def _run_re_flagger(project_id, pdir, rc, re_path, cancel_event, gemini_api_key)
             _update_job(project_id, status="paused")
             return
 
-        if summary.get("aborted_gemini"):
-            db.update_stage7_status(project_id, "gemini_unavailable")
-            db.add_log(project_id, 7, "Gemini aborted mid-run — choose Retry or Continue manually")
-            _update_job(project_id, status="gemini_unavailable",
-                        progress="Gemini aborted — choose Retry or Continue manually",
-                        re_path=re_path)
-            return
-
-        review_count = len(db.get_s7_review_queue(project_id))
-        if review_count > 0:
-            db.update_stage7_status(project_id, "review_needed")
-            db.add_log(project_id, 7, f"RE matching done — {review_count:,} rows need human review")
-            _update_job(project_id, status="review_needed",
-                        progress=f"{review_count:,} rows in review queue")
-        else:
-            rows = apply_re_decisions_and_save(project_id, pdir, rc, db)
-            db.update_stage7_status(project_id, "complete")
-            db.add_log(project_id, 7, f"Stage 7 complete — {rows:,} rows")
-            _update_job(project_id, status="done")
+        rows = apply_re_decisions_and_save(project_id, pdir, rc, db)
+        db.update_stage7_status(project_id, "complete")
+        db.add_log(project_id, 7,
+                   f"Stage 7 complete — {rows:,} rows "
+                   f"({summary['match']:,} Match / {summary['probable']:,} Probable / "
+                   f"{summary['potential']:,} Potential)")
+        _update_job(project_id, status="done")
     except Exception as exc:
         _cancel_events.pop(project_id, None)
         db.update_stage7_status(project_id, "error")
         db.add_log(project_id, 7, f"ERROR: {exc}")
         _update_job(project_id, status="error", progress=str(exc))
-
-
-@app.route("/project/<int:project_id>/stage7/continue-manually", methods=["POST"])
-def stage7_continue_manually(project_id):
-    """Re-run RE flagging with Gemini disabled. The RE export path is stashed on the job."""
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-
-    job = _job(project_id) or {}
-    re_path = job.get("re_path")
-    if not re_path or not os.path.exists(re_path):
-        # Fall back to looking up the saved RE export in the project dir.
-        pdir = db.project_dir(project_id, project["region_code"])
-        matches = sorted(glob.glob(os.path.join(pdir, f"re_export_{project['region_code']}.*")))
-        if not matches:
-            return jsonify({"error": "RE export file not found — re-upload it."}), 400
-        re_path = matches[0]
-
-    pdir = db.project_dir(project_id, project["region_code"])
-    rc = project["region_code"]
-    _set_job(project_id, {"stage": 7, "status": "running",
-                          "progress": "Manual mode — skipping Gemini…", "re_path": re_path})
-    db.update_stage7_status(project_id, "running")
-    ev = threading.Event()
-    _cancel_events[project_id] = ev
-    threading.Thread(target=_run_re_flagger,
-                     args=(project_id, pdir, rc, re_path, ev, ""), daemon=True).start()
-    return redirect(url_for("project_detail", project_id=project_id))
-
-
-@app.route("/project/<int:project_id>/stage7/retry-gemini", methods=["POST"])
-def stage7_retry_gemini(project_id):
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-
-    job = _job(project_id)
-    if job and job.get("stage") == 7 and job.get("status") == "running":
-        return jsonify({"error": "RE matching already running"}), 409
-
-    status, details = gemini_health.ping(GEMINI_API_KEY)
-    if status != "ok":
-        db.update_stage7_status(project_id, "gemini_unavailable")
-        db.add_log(project_id, 7, f"Retry pre-flight failed: {gemini_health.human(status)} — {details}")
-        _set_job(project_id, {"stage": 7, "status": "gemini_unavailable",
-                              "progress": gemini_health.human(status), "detail": details})
-        return redirect(url_for("project_detail", project_id=project_id))
-
-    pdir = db.project_dir(project_id, project["region_code"])
-    rc = project["region_code"]
-    _set_job(project_id, {"stage": 7, "status": "running", "progress": "Retrying Gemini…"})
-    db.update_stage7_status(project_id, "running")
-    ev = threading.Event()
-    _cancel_events[project_id] = ev
-
-    def worker():
-        def cb(msg):
-            db.add_log(project_id, 7, msg)
-            _update_job(project_id, progress=msg)
-        try:
-            summary = re_flagger_retry(project_id, pdir, rc, GEMINI_API_KEY,
-                                       db=db, progress_cb=cb, cancel_event=ev)
-            _cancel_events.pop(project_id, None)
-            if summary.get("aborted_gemini"):
-                db.update_stage7_status(project_id, "gemini_unavailable")
-                db.add_log(project_id, 7, "Retry hit consecutive Gemini errors again")
-                _update_job(project_id, status="gemini_unavailable",
-                            progress="Gemini still failing")
-                return
-            review_count = len(db.get_s7_review_queue(project_id))
-            if review_count > 0:
-                db.update_stage7_status(project_id, "review_needed")
-                _update_job(project_id, status="review_needed",
-                            progress=f"{review_count:,} rows still in review")
-            else:
-                rows = apply_re_decisions_and_save(project_id, pdir, rc, db)
-                db.update_stage7_status(project_id, "complete")
-                db.add_log(project_id, 7, f"Stage 7 complete after retry — {rows:,} rows")
-                _update_job(project_id, status="done")
-        except Exception as exc:
-            _cancel_events.pop(project_id, None)
-            db.update_stage7_status(project_id, "error")
-            db.add_log(project_id, 7, f"Retry ERROR: {exc}")
-            _update_job(project_id, status="error", progress=str(exc))
-
-    threading.Thread(target=worker, daemon=True).start()
-    return redirect(url_for("project_detail", project_id=project_id))
-
-
-@app.route("/project/<int:project_id>/stage7/review")
-def stage7_review(project_id):
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-    queue = db.get_s7_review_queue(project_id)
-
-    pdir = db.project_dir(project_id, project["region_code"])
-    rc = project["region_code"]
-    for suffix in ["vs", "classified", "enriched", "raw"]:
-        mp = os.path.join(pdir, f"master_{rc}_{suffix}.csv")
-        if os.path.exists(mp):
-            df = pd.read_csv(mp, dtype=str, keep_default_na=False,
-                             usecols=["Unique ID", "Officer name", "Company Name"])
-            lookup = {r["Unique ID"]: r for _, r in df.iterrows()}
-            for item in queue:
-                info = lookup.get(item["unique_id"], {})
-                item["officer_name"] = info.get("Officer name", "")
-                item["company_name"] = info.get("Company Name", "")
-            break
-
-    pass1_scores = db.get_s7_pass1_scores(project_id)
-    failed_count = 0
-    for item in queue:
-        item["fuzzy_score"] = pass1_scores.get(item["unique_id"])
-
-        reason = item.get("reason") or ""
-        if reason.startswith("Gemini error"):
-            item["source"] = "Gemini error"
-            failed_count += 1
-        elif reason.startswith("Gemini not configured"):
-            item["source"] = "No Gemini"
-            failed_count += 1
-        else:
-            item["source"] = "Gemini low-conf"
-
-    queue.sort(key=lambda r: (r.get("fuzzy_score") or 0), reverse=True)
-
-    return render_template("stage7_review.html", project=project, queue=queue,
-                           failed_count=failed_count)
-
-
-@app.route("/project/<int:project_id>/stage7/submit-review", methods=["POST"])
-def stage7_submit_review(project_id):
-    project = db.get_project(project_id)
-    if not project:
-        abort(404)
-
-    # Radio buttons are submitted as decision_<unique_id> = match|no_match
-    for key, value in request.form.items():
-        if not key.startswith("decision_"):
-            continue
-        uid = key[len("decision_"):]
-        label = value.strip()
-        if label in ("match", "no_match"):
-            db.log_s7_decision(project_id, uid, "", "person", label,
-                               reason="Human review", pass_num=3)
-
-    remaining = db.get_s7_review_queue(project_id)
-    if not remaining:
-        pdir = db.project_dir(project_id, project["region_code"])
-        rc = project["region_code"]
-        rows = apply_re_decisions_and_save(project_id, pdir, rc, db)
-        db.update_stage7_status(project_id, "complete")
-        db.add_log(project_id, 7, f"Stage 7 complete — {rows:,} rows (human review done)")
-
-    return redirect(url_for("project_detail", project_id=project_id))
 
 
 @app.route("/project/<int:project_id>/stage7/skip", methods=["POST"])
@@ -1421,4 +1296,13 @@ def stage8_export(project_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5050)
+    # Stage jobs run as daemon threads inside this process, so any stage still
+    # marked 'running' from a previous server is dead — surface it as an error
+    # instead of showing frozen progress.
+    for pid, stage in db.fail_stale_running_stages():
+        db.add_log(pid, stage,
+                   "ERROR: server restarted mid-run — job lost, please re-run this stage")
+    # use_reloader=False: the auto-reloader restarts the process on every file
+    # save, which silently kills running stage threads. Restart manually after
+    # code changes instead.
+    app.run(debug=True, use_reloader=False, port=5050)

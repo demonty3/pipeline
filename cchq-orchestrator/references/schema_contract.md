@@ -21,9 +21,9 @@ to confirm which `master_<REGION>_*.csv` exists before advancing.
 |-------------|------------------------------------|-----------------|
 | 2 merge     | `master_<RC>_raw.csv`              | `Unique ID` + 26 CH cols + `SIC Industry`, `Directorships`, `Apollo Duplicate` |
 | 4 ingest    | `master_<RC>_enriched.csv`         | + 22 `Apollo <col>` columns |
-| 5 classify  | `master_<RC>_classified.csv`       | + `Match?` / `Result` (Y / T / N) |
+| 5 classify  | `master_<RC>_classified.csv`       | + `Result` (Y / T / N) |
 | 6 vs-return | `master_<RC>_vs.csv`               | + whatever columns the VoteSource return carried |
-| 7 re-flag   | `master_<RC>_re_flagged.csv`       | + `RE Match?`, `Potential`, `Match?` |
+| 7 re-flag   | `master_<RC>_re_flagged.csv`       | + `RE Match?`, `Potential`, `RE Name`, `Match?` |
 | 8 export    | `<RC>_final_deliverable.xlsx`      | multi-tab, reshaped to v3 layout (see below) |
 
 Stage 8 reads the **most enriched** master that exists
@@ -76,21 +76,49 @@ matches Apollo's already-cleaned name.
 
 ## Classifier / RE-flagger columns
 
-- Stage 5 writes `Result` ∈ {`Y`, `T`, `N`}. Cascade: deterministic fuzzy
-  score (≥85 → Y, <45 → N, middle → Tentative) → Gemini judges the Tentative
-  band in batches → only Gemini-low-confidence rows reach human review.
-- Stage 7 writes `RE Match?` (`Y`/blank), `Potential`, and `Match?`. Same
-  deterministic → Gemini → human cascade against the Raiser's Edge name list.
+These are the **internal master** columns; the Stage 8 deliverable remaps them to
+the golden v3 format (see the mapping note below).
+
+- Stage 5 writes `Result` ∈ {`Y`, `T`, `N`} — the sanity check (does the Apollo
+  contact match the CH officer). Cascade: deterministic fuzzy score (≥85 → Y,
+  <45 → N, middle → Tentative) → deterministic evidence pass on the Tentative
+  band (core-name agreement ignoring middle names, nickname re-score with a
+  surname-contradiction guard, email corroboration; upgrade-only, T → Y) →
+  only no-evidence rows reach human review. (Gemini removed 2026-06-11.)
+- Stage 7 writes `RE Match?` (`Y`/blank), `Potential`, and an internal `Match?`
+  (the audit factor string, e.g. `name 95, email exact`). **Formulas only — RE
+  donor data is highly sensitive and must never reach an LLM (Charles,
+  2026-06-10).** `Potential` carries the certainty tier:
+  `Match` (exact email + plausible name) > `Probable` (exact email with weak
+  name, or strong name + same postcode/town) > `Potential` (name similarity
+  alone — never elevated without a corroborating factor). All three tiers get
+  `RE Match? = Y` and land on the Potential RE Match tab.
+  (The 2026-06-12 full-postcode/surname tightening was reverted the same day —
+  Harry: keep the matching aligned with how the golden deliverable was
+  produced.)
 
 ---
 
 ## Stage 8 deliverable layout (the v3 shape — DO NOT drift)
 
-Matches `Leicester - Data v3.xlsx` exactly. Three tabs:
+Matches `Leicester - Data v3.xlsx` exactly. Three tabs, **in golden's order:
+ALL, Potential RE Match, Y&T** (the RE pass comes first). Rows sort by Unique
+ID as (prefix, then number) — golden runs the whole #LE1 block ascending, then
+#LE2, etc. Cell types follow golden where golden is sound: DOB cells are real
+datetimes displayed `mmm-yyyy` ("Feb-1958"); `# Employees` / `Annual Revenue` /
+`Total Funding` / `Company Founded Year` are ints when purely numeric. Two
+deliberate deviations where golden is broken: `Company Number` stays
+zero-padded TEXT (golden stored ints and lost CH leading zeros), and
+appointment/creation dates are real ISO dates (golden contains literal
+`########` strings from a copy-paste artifact). Tabs:
 
 - **ALL** — every row, full column set below.
-- **Y&T** — rows where `Result` ∈ {`Y`, `T`}.
-- **Potential RE Match** — rows where `RE Match?` == `Y`.
+- **Y&T** — rows where the sanity check is Yes/Tentative (deliverable `Match?` ∈
+  {`Yes`, `Tentative`}; internally `Result` ∈ {`Y`, `T`}) **and the row is not
+  RE-flagged**. The RE match takes precedence (Charles, 2026-06-12 — verified
+  against golden: Leicester's flagged rows appear only on ALL + the RE tab,
+  never on Y&T): existing donors must not land on the cold-outreach list.
+- **Potential RE Match** — rows where `RE Match?` == `Y` (master-internal flag).
 
 Column order on every tab (note the deliberate **blank spacer columns** and the
 **echo copies** of Surname / First Name / Company Name that sit between the CH
@@ -104,13 +132,27 @@ Unique ID,
                                                        26-col master)
 <blank>, <blank>,
 RE Match?, Potential, <blank>, Match?,
+                                   (golden semantics, confirmed 2026-06-12:
+                                    RE Match? = the certainty slot — golden
+                                    showed 'Potential'; now the tier word
+                                    Match/Probable/Potential. Potential = the
+                                    matched RE donor's NAME, as golden.)
 Surname (echo), First Name (echo), Company Name (echo), Result,
 <22 Apollo cols, prefix stripped: First Name … Company Founded Year>
 ```
 
-Sort: by CH `Company Name`, case-insensitive, before the rename step (because
-post-rename there are duplicate `Company Name` labels across the CH / echo /
-Apollo groups).
+**Golden value mapping (applied at export only — the master keeps `Y`/`T`/`N`).**
+Confirmed against the real `Leicester - Data v3.xlsx` cells (7,244 rows): the
+deliverable's **`Match?`** column holds the *sanity check* as `Yes` / `No` /
+`Tentative` (mapped from the master's `Result`), and the **`Result`** column holds
+`Matched` / `N/A` (whether Apollo returned a contact). The RE-flagger's internal
+factor string (master `Match?`) is NOT shown — RE lives in `RE Match?` / `Potential`.
+
+Sort: by `Unique ID` ascending, matching golden v3 (its rows run
+`#LE1-0005, 0008, 0009, 0017 …` — UID order, *not* company-name order). Sort on
+the **numeric suffix**, not the raw string — UIDs aren't zero-padded to a fixed
+width (`#ESSEX-9999` then `#ESSEX-10000`), so a lexicographic sort interleaves
+them wrongly.
 
 **If you change anything in this file, regenerate one project end-to-end and
 diff the Stage 8 output against `Leicester - Data v3.xlsx` before shipping.**

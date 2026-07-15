@@ -29,3 +29,6 @@ cchq-orchestrator/state/
 # Local DB snapshots and recovery artifacts (not for source control)
 *.db.bak_*
 _quarantine_*/
+
+# graphify knowledge-graph output (local agent tooling, not a deliverable)
+graphify-out/
